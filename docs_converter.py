@@ -94,13 +94,16 @@ class MarkdownToDocsConverter:
                     if text_style:
                         fmt_start = start_index + fmt['start']
                         fmt_end = start_index + fmt['end']
-                        requests.append({
-                            'updateTextStyle': {
-                                'range': {'startIndex': fmt_start, 'endIndex': fmt_end},
-                                'textStyle': text_style,
-                                'fields': ','.join(fields)
-                            }
-                        })
+
+                        # Skip empty ranges
+                        if fmt_start < fmt_end:
+                            requests.append({
+                                'updateTextStyle': {
+                                    'range': {'startIndex': fmt_start, 'endIndex': fmt_end},
+                                    'textStyle': text_style,
+                                    'fields': ','.join(fields)
+                                }
+                            })
 
             # Apply list formatting
             if part.get('list_type'):
