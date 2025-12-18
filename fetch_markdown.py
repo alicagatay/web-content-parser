@@ -75,7 +75,9 @@ def check_existing_doc(drive_service, folder_id: str, title: str) -> str:
 
     while True:
         # Search for exact title match in the folder
-        query = f"name='{title}' and '{folder_id}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false"
+        # Escape single quotes in title for Drive API query
+        escaped_title = title.replace("'", "\\'")
+        query = f"name='{escaped_title}' and '{folder_id}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false"
         results = drive_service.files().list(
             q=query,
             spaces='drive',
@@ -210,12 +212,12 @@ async def process_url(
     session: aiohttp.ClientSession,
     original_url: str,
     folder_id: str
-) -> tuple[str, str, bool]:
+) -> tuple[str, str, str, bool]:
     """
     Process a single URL: fetch markdown, create Google Doc.
 
     Returns:
-        (original_url, doc_url, used_title)
+        (original_url, doc_url, doc_title, used_title)
     """
     target = into_md_url(original_url)
     md = await fetch_markdown(session, target)
@@ -230,7 +232,7 @@ async def process_url(
     # Create Google Doc
     doc_url = await create_google_doc(md, doc_title, folder_id)
 
-    return (original_url, doc_url, bool(title))
+    return (original_url, doc_url, doc_title, bool(title))
 
 
 async def main(urls: list[str]) -> None:
@@ -265,9 +267,9 @@ async def main(urls: list[str]) -> None:
             print(f"[FAIL] {url} -> {result}", file=sys.stderr)
         else:
             ok += 1
-            original_url, doc_url, used_title = result
+            original_url, doc_url, doc_title, used_title = result
             note = "title" if used_title else "fallback"
-            print(f"[OK] ({note}) {original_url} -> {doc_url}")
+            print(f'[OK] || "{doc_title}" || ({note}) || {original_url} -> {doc_url}')
 
     print(f"\n✓ Done: {ok}/{len(urls)} succeeded.")
 
