@@ -40,3 +40,6 @@ Thumbs.db
 # Project specific
 credentials.json
 token.json
+
+# Local-only convenience wrapper
+bin/
