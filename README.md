@@ -1,15 +1,32 @@
 # Web Content Parser
 
-A Python CLI tool to fetch markdown versions of web pages using [into.md](https://into.md/) and automatically create formatted Google Docs in your Drive.
+A powerful Python CLI tool that fetches web content and automatically creates formatted Google Docs. Uses intelligent hybrid extraction combining fast HTTP requests with headless browser automation for JavaScript-heavy sites.
 
 ## Features
 
-- **Concurrent fetching** of unlimited URLs using async/await
+### Core Capabilities
+
+- **Intelligent dual extraction** - runs both aiohttp and Playwright in parallel, uses longest result
+- **Multi-method content extraction** - combines trafilatura and multi-div extraction for maximum completeness
+- **High concurrency** - processes 15 URLs simultaneously (configurable)
 - **Google Docs integration** - automatically creates formatted documents in your Drive
 - **Smart formatting** - converts markdown to native Google Docs formatting (headings, bold, italic, links, lists)
-- **Automatic title extraction** from markdown (first H1)
+
+### Content Extraction
+
+- **trafilatura** - smart content detection with noise filtering
+- **multi-div extraction** - handles sites that split articles across multiple containers (e.g., Ars Technica)
+- **Playwright browser automation** - handles JavaScript-rendered content (Medium, LinkedIn, etc.)
+- **Stealth mode** - anti-detection headers and settings to bypass basic bot protection
+- **Automatic method selection** - always uses the extraction that gets the most content
+
+### Reliability & UX
+
+- **Automatic retry** - failed URLs retry up to 3 rounds with exponential backoff
+- **Automatic title extraction** - from metadata, H1 headings, or URL fallback
 - **Duplicate detection** - adds (2), (3) suffixes for docs with same title
-- **Real-time progress bar** showing completion status and speed
+- **Real-time progress bar** - shows completion status, speed, and extraction method used
+- **Detailed logging** - shows extraction method, content length, and document title for each URL
 - **OAuth authentication** - one-time browser login, then automatic for future runs
 - **Resilient error handling** - continues processing even if some URLs fail
 
@@ -18,6 +35,7 @@ A Python CLI tool to fetch markdown versions of web pages using [into.md](https:
 - Python 3.10+
 - Google Cloud account (free)
 - Google Drive folder named "Resources" (or customize in code)
+- Playwright browsers (automatically installed)
 
 ## Installation
 
@@ -27,6 +45,7 @@ Using conda (recommended):
 
 ```bash
 conda install -c conda-forge aiohttp tqdm google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client markdown-it-py
+pip install trafilatura playwright lxml html2text
 ```
 
 Or using pip:
@@ -35,7 +54,13 @@ Or using pip:
 pip install -r requirements.txt
 ```
 
-### 2. Set up Google Cloud OAuth
+### 2. Install Playwright browsers
+
+```bash
+playwright install chromium
+```
+
+### 3. Set up Google Cloud OAuth
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
 2. Create a new project (or select existing)
@@ -55,7 +80,7 @@ pip install -r requirements.txt
    - Application type: **Desktop app**
    - Download JSON and save as `credentials.json` in project root
 
-### 3. Configure target folder (optional)
+### 4. Configure target folder (optional)
 
 By default, docs are created in a folder named **"Resources"** in your Google Drive. To use a different folder:
 
@@ -81,11 +106,17 @@ python fetch_markdown.py "https://example.com/article1" "https://example.com/art
 
 1. Authenticates with Google (uses cached token after first run)
 2. Finds your "Resources" folder in Google Drive
-3. Fetches markdown from into.md for each URL concurrently
-4. Extracts article title from first H1 heading
-5. Creates formatted Google Doc in your Resources folder
-6. Applies markdown formatting (headings, bold, italic, links, lists)
-7. Returns shareable document URL
+3. **Launches headless Chromium browser** (Playwright)
+4. **Fetches content using BOTH methods in parallel:**
+   - **aiohttp** - fast HTTP request (~1-2s)
+   - **Playwright** - headless browser with JavaScript execution (~5-8s)
+5. **Tries BOTH extraction methods on each HTML source:**
+   - **trafilatura** - smart content detection with noise filtering
+   - **multi-div** - combines multiple content containers (for split articles)
+6. **Automatically uses the longest result** from all 4 combinations
+7. Extracts article title (metadata → H1 → URL fallback)
+8. Creates formatted Google Doc in your Resources folder
+9. Returns shareable document URL with detailed extraction info
 
 ### Example with multiple URLs:
 
@@ -96,6 +127,17 @@ python fetch_markdown.py \
   "https://techcrunch.com/2024/01/15/..."
 ```
 
+### Real-world batch processing (60 URLs):
+
+```bash
+python fetch_markdown.py \
+  "https://www.a16z.news/p/state-of-consumer-ai-2025" \
+  "https://www.growthunhinged.com/p/the-best-growth-tactics-of-2025" \
+  ...  # 58 more URLs
+```
+
+**Performance:** 60 URLs in ~4.5 minutes (4.6s average per doc)
+
 ## Output
 
 **Progress Output:**
@@ -104,40 +146,70 @@ python fetch_markdown.py \
 Locating Google Drive folder...
 ✓ Found 'Resources' folder
 
-Fetching & Creating: 100%|████████████| 3/3 [00:08<00:00, 2.67s/doc]
+Fetching & Creating: 100%|████████████| 60/60 [04:36<00:00, 4.61s/doc]
 
-[OK] (title) https://example.com/article -> https://docs.google.com/document/d/...
+[OK] || [aiohttp with multi-div] || 53,008 chars || "SpaceX's historic rocket landing" || https://arstechnica.com/... -> https://docs.google.com/document/d/...
+[OK] || [playwright with trafilatura] || 9,527 chars || "Introducing GPT-5.2-Codex" || https://openai.com/... -> https://docs.google.com/document/d/...
+[OK] || [aiohttp with trafilatura] || 56,708 chars || "Let a thousand societies bloom" || https://vitalik.eth.limo/... -> https://docs.google.com/document/d/...
 
-✓ Done: 3/3 succeeded.
+✓ Done: 60/60 succeeded, 0 failed.
 ```
+
+**Log Format:**
+
+```
+[OK] || [extraction_method] || content_length || "Document Title" || source_url -> google_doc_url
+```
+
+**Extraction methods shown:**
+
+- `aiohttp with trafilatura` - Fast HTTP + smart content detection
+- `aiohttp with multi-div` - Fast HTTP + multi-container extraction
+- `playwright with trafilatura` - Browser automation + smart detection
+- `playwright with multi-div` - Browser automation + multi-container extraction
 
 All Google Docs are created in your **Resources** folder with:
 
 - Native Google Docs formatting (not plain text)
 - Proper headings, bold, italic, links, lists, code blocks
 - Duplicate handling: `Title`, `Title (2)`, `Title (3)`, etc.
+- Content from whichever extraction method got the most text
 
 ## Project Structure
 
 ```
 web-content-parser/
-├── fetch_markdown.py      # Main CLI script
+├── fetch_markdown.py      # Main CLI script with hybrid extraction
 ├── auth.py                # OAuth authentication & Google API clients
 ├── docs_converter.py      # Markdown → Google Docs formatting converter
 ├── requirements.txt       # Python dependencies
 ├── credentials.json      # OAuth client secrets (git-ignored)
 ├── token.json           # User access tokens (git-ignored)
+├── bin/
+│   └── web-content-parser # Global command wrapper
 └── README.md
 ```
 
 ## Configuration
 
-- **Timeout**: 30 seconds per request
-- **Target folder**: "Resources" in Google Drive (hardcoded in `fetch_markdown.py`)
-- **Concurrency**: Unlimited - all URLs are fetched simultaneously
-- **OAuth scopes**:
-  - `documents` - create and edit Google Docs
-  - `drive` - access Drive folders and create files
+### Performance Settings
+
+- **Concurrency**: 15 parallel tasks (both aiohttp and Playwright)
+- **Timeout**: 30s for aiohttp, 45s for Playwright
+- **Retries**: 2 per-URL retries + 3 batch-level retry rounds
+- **Target folder**: "Resources" in Google Drive (customizable in `fetch_markdown.py`)
+
+### Extraction Strategy
+
+- **Always runs both fetch methods** (aiohttp + Playwright) in parallel
+- **Always tries both extraction methods** (trafilatura + multi-div) on each HTML source
+- **Compares all 4 combinations** and uses the longest result
+- **No manual mode selection needed** - fully automatic
+
+### OAuth Scopes
+
+- `documents` - create and edit Google Docs
+- `drive` - access Drive folders and create files
 
 ## Security
 
@@ -150,29 +222,77 @@ Sensitive files are excluded from git via `.gitignore`:
 
 ## How It Works
 
-1. **Authentication** (`auth.py`):
+### 1. **Authentication** (`auth.py`):
 
-   - First run: opens browser for OAuth consent
-   - Saves tokens to `token.json` for automatic refresh
-   - Creates authenticated Google Docs & Drive API clients
+- First run: opens browser for OAuth consent
+- Saves tokens to `token.json` for automatic refresh
+- Creates authenticated Google Docs & Drive API clients
 
-2. **Fetching** (`fetch_markdown.py`):
+### 2. **Parallel Fetching** (`fetch_markdown.py`):
 
-   - Uses `aiohttp` for concurrent HTTP requests to into.md
-   - Each URL is processed independently with timeout protection
-   - Failures don't block other URLs
+- Launches headless Chromium browser (Playwright)
+- For each URL, runs **both methods in parallel**:
+  - **aiohttp**: Fast HTTP GET, static HTML (~1-2s)
+  - **Playwright**: Headless browser, executes JavaScript, waits for content (~5-8s)
+- Both complete simultaneously; tool waits for both results
 
-3. **Document Creation**:
+### 3. **Dual Extraction**:
 
-   - Parses markdown with `markdown-it-py`
-   - Converts to Google Docs API `batchUpdate` requests
-   - Creates doc via Drive API (bypasses service account quota issues)
-   - Applies formatting with Docs API in single batch operation
+- Runs **both extraction methods** on each HTML source:
+  - **trafilatura**: Content scoring algorithm, finds single best content block
+    - Smart noise filtering (ads, navigation, footers)
+    - Content density analysis
+    - Returns clean markdown
+  - **multi-div**: XPath pattern matching, combines ALL matching containers
+    - Patterns: `post-content`, `article-content`, `article-body`, etc.
+    - Handles split articles (e.g., Ars Technica with 26 separate divs)
+    - Converts combined HTML to markdown with html2text
 
-4. **Formatting** (`docs_converter.py`):
-   - Reverse insertion strategy (insertions from end to start)
-   - Handles headings (H1-H6), bold, italic, links, lists, code blocks
-   - Preserves markdown structure as native Google Docs elements
+### 4. **Maximum Content Selection**:
+
+- Compares **all 4 results**:
+  1.  aiohttp HTML + trafilatura extraction
+  2.  aiohttp HTML + multi-div extraction
+  3.  Playwright HTML + trafilatura extraction
+  4.  Playwright HTML + multi-div extraction
+- Uses whichever got the **longest content** (measured in characters)
+- Tracks winning method for logging
+
+### 5. **Document Creation**:
+
+- Parses markdown with `markdown-it-py`
+- Converts to Google Docs API `batchUpdate` requests
+- Creates doc via Drive API (bypasses service account quota issues)
+- Applies formatting with Docs API in single batch operation
+
+### 6. **Formatting** (`docs_converter.py`):
+
+- Reverse insertion strategy (insertions from end to start)
+- Handles headings (H1-H6), bold, italic, links, lists, code blocks
+- Preserves markdown structure as native Google Docs elements
+
+## Why This Approach?
+
+### Hybrid Fetching (aiohttp + Playwright)
+
+- **aiohttp wins 82% of the time** - faster for static sites
+- **Playwright needed for 18%** - JavaScript-heavy sites (Medium, LinkedIn, etc.)
+- **Parallel execution** - total time ≈ slower method, not both added together
+- **Some sites block Playwright** - aiohttp bypasses simple bot detection
+
+### Dual Extraction (trafilatura + multi-div)
+
+- **trafilatura** - best for standard articles, smart noise filtering
+- **multi-div** - catches split-content articles trafilatura misses
+- **Both complement each other** - different strengths for different site structures
+
+### Real-World Results
+
+- **60 URLs tested**: 100% success rate
+- **Average**: 4.6s per document
+- **Longest article**: 69,966 chars (Backlinko guide)
+- **Mix**: 49 used aiohttp, 11 needed Playwright
+- **Ars Technica**: 53,008 chars (20-page Google Doc) - multi-div won by 18.9x over trafilatura alone
 
 ## Troubleshooting
 
@@ -193,8 +313,33 @@ Sensitive files are excluded from git via `.gitignore`:
 - Delete `token.json` and re-run to re-authenticate
 - Verify `credentials.json` is valid OAuth Desktop client
 
-### Formatting issues
+### Content still truncated/incomplete
 
-- The script uses a simplified markdown parser
-- Complex nested structures may not render perfectly
-- Manual touch-ups in Google Docs may be needed for some articles
+The tool already uses maximum extraction:
+
+- Runs both aiohttp and Playwright in parallel
+- Tries both trafilatura and multi-div on each
+- Uses the longest result automatically
+
+If content is still incomplete, the site may:
+
+- Use client-side rendering that Playwright can't access
+- Block automated access with sophisticated bot detection
+- Require authentication/subscription
+- Use infinite scroll or pagination (not yet supported)
+
+### Playwright errors
+
+```bash
+# Reinstall Playwright browsers
+playwright install chromium
+
+# Or install all browsers
+playwright install
+```
+
+### Slow performance
+
+- Default: 15 parallel tasks (both aiohttp + Playwright running)
+- Adjust `MAX_CONCURRENCY` and `PLAYWRIGHT_CONCURRENCY` in `fetch_markdown.py`
+- Lower for slower machines, higher for faster (max recommended: 20)
