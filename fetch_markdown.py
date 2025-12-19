@@ -9,37 +9,21 @@ from urllib.parse import urlparse
 import aiohttp
 from tqdm.asyncio import tqdm
 
+try:
+    import trafilatura
+except Exception:  # pragma: no cover
+    trafilatura = None
+
 # Import Google API modules
 from auth import get_docs_service, get_drive_service, find_folder_id
 from docs_converter import convert_markdown_to_doc_requests
 
 TIMEOUT_SECS = 30
 DRIVE_FOLDER_NAME = "Resources"  # Google Drive folder name for created docs
-
-
-def into_md_url(url: str) -> str:
-    """
-    Transform a regular URL into an into.md API URL.
-
-    Example:
-        https://example.com/article -> https://into.md/https:/example.com/article
-    """
-    url = url.strip()
-
-    # If already an into.md URL, return as-is
-    if url.startswith("https://into.md/"):
-        return url
-
-    # Remove protocol prefix to reconstruct with into.md
-    if url.startswith("https://"):
-        clean_url = url[len("https://"):]
-        return f"https://into.md/https:/{clean_url}"
-    elif url.startswith("http://"):
-        clean_url = url[len("http://"):]
-        return f"https://into.md/http:/{clean_url}"
-    else:
-        # Assume https if no protocol given
-        return f"https://into.md/https:/{url}"
+MAX_CONCURRENCY = 20
+FETCH_RETRIES = 2
+FETCH_RETRY_BASE_DELAY_SECS = 1.0
+MAX_RETRY_ROUNDS = 3
 
 
 def sanitize_doc_title(name: str) -> str:
@@ -152,6 +136,44 @@ async def create_google_doc(markdown_content: str, title: str, folder_id: str) -
         raise RuntimeError(f"Failed to create Google Doc: {e}")
 
 
+def extract_title_from_metadata(html: str, url: str) -> str | None:
+    """
+    Extract title from page metadata using trafilatura.
+
+    Returns:
+        The title from metadata, or None if not found
+    """
+    if trafilatura is None:
+        return None
+
+    try:
+        metadata = trafilatura.extract_metadata(html, default_url=url)
+        if metadata and metadata.title:
+            return metadata.title.strip()
+    except Exception:
+        pass
+    return None
+
+
+def extract_title_from_metadata(html: str, url: str) -> str | None:
+    """
+    Extract title from page metadata using trafilatura.
+
+    Returns:
+        The title from metadata, or None if not found
+    """
+    if trafilatura is None:
+        return None
+
+    try:
+        metadata = trafilatura.extract_metadata(html, default_url=url)
+        if metadata and metadata.title:
+            return metadata.title.strip()
+    except Exception:
+        pass
+    return None
+
+
 def extract_h1_title(markdown: str) -> str | None:
     """
     Extract the first H1 heading from markdown content.
@@ -198,32 +220,80 @@ def unique_path(path: Path) -> Path:
 
 async def fetch_markdown(
     session: aiohttp.ClientSession,
-    target: str
-) -> str:
+    url: str
+) -> tuple[str, str]:
     """
-    Fetch markdown content from a URL.
+    Fetch HTML and extract markdown content using trafilatura.
+
+    Returns:
+        tuple[html, markdown]: Raw HTML and extracted markdown
     """
-    async with session.get(target) as resp:
-        resp.raise_for_status()
-        return await resp.text()
+    if trafilatura is None:
+        raise RuntimeError(
+            "trafilatura is not installed. Install it with: pip install trafilatura"
+        )
+
+    # Ensure URL has scheme
+    url = url.strip()
+    if "://" not in url:
+        url = "https://" + url
+
+    last_error: Exception | None = None
+
+    for attempt in range(FETCH_RETRIES + 1):
+        try:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                html = await resp.text()
+
+            # Extract markdown using trafilatura
+            md = trafilatura.extract(
+                html,
+                include_comments=False,
+                include_tables=True,
+                include_links=True,
+                favor_recall=True,
+                output_format="markdown",
+                url=url,
+            )
+
+            if not md or not md.strip():
+                raise RuntimeError("Content extraction produced empty result")
+
+            return (html, md)
+
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            last_error = e
+            if attempt >= FETCH_RETRIES:
+                break
+
+            await asyncio.sleep(FETCH_RETRY_BASE_DELAY_SECS * (2 ** attempt))
+
+    raise RuntimeError(f"Failed to extract content from {url}: {last_error}")
 
 
 async def process_url(
     session: aiohttp.ClientSession,
     original_url: str,
-    folder_id: str
+    folder_id: str,
+    semaphore: asyncio.Semaphore
 ) -> tuple[str, str, str, bool]:
     """
-    Process a single URL: fetch markdown, create Google Doc.
+    Process a single URL: fetch HTML, extract markdown, create Google Doc.
 
     Returns:
         (original_url, doc_url, doc_title, used_title)
     """
-    target = into_md_url(original_url)
-    md = await fetch_markdown(session, target)
+    async with semaphore:
+        html, md = await fetch_markdown(session, original_url)
 
-    # Try to extract title from markdown
-    title = extract_h1_title(md)
+    # Try to extract title: metadata → H1 → URL fallback
+    title = extract_title_from_metadata(html, original_url)
+    used_metadata = bool(title)
+
+    if not title:
+        title = extract_h1_title(md)
+
     if title:
         doc_title = sanitize_doc_title(title)
     else:
@@ -232,12 +302,24 @@ async def process_url(
     # Create Google Doc
     doc_url = await create_google_doc(md, doc_title, folder_id)
 
-    return (original_url, doc_url, doc_title, bool(title))
+    return (original_url, doc_url, doc_title, used_metadata or bool(title))
+
+
+async def process_url_safe(
+    session: aiohttp.ClientSession,
+    original_url: str,
+    folder_id: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, tuple[str, str, str, bool] | Exception]:
+    try:
+        return (original_url, await process_url(session, original_url, folder_id, semaphore))
+    except Exception as e:
+        return (original_url, e)
 
 
 async def main(urls: list[str]) -> None:
     """
-    Main async entry point: process all URLs concurrently.
+    Main async entry point: process all URLs concurrently with automatic retry.
     """
     try:
         # Find the Resources folder
@@ -249,29 +331,76 @@ async def main(urls: list[str]) -> None:
         sys.exit(1)
 
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECS)
-    headers = {"User-Agent": "web-content-parser/1.0"}
+    # Use browser-like headers for better compatibility with target sites.
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    all_results: dict[str, tuple[str, str, str, bool] | Exception] = {}
+    urls_to_process = list(urls)
+    retry_round = 0
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        tasks = [process_url(session, u, folder_id) for u in urls]
+        while urls_to_process and retry_round < MAX_RETRY_ROUNDS:
+            retry_round += 1
 
-        # Use tqdm to show progress bar as tasks complete
-        results = []
-        for coro in tqdm.as_completed(tasks, total=len(urls), desc="Fetching & Creating", unit="doc"):
-            results.append(await coro)
+            if retry_round == 1:
+                desc = "Fetching & Creating"
+            else:
+                desc = f"Retry {retry_round - 1}/{MAX_RETRY_ROUNDS - 1}"
 
-    # Report results
+            semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+            tasks = [
+                asyncio.create_task(process_url_safe(session, u, folder_id, semaphore))
+                for u in urls_to_process
+            ]
+
+            # Use tqdm to show progress bar as tasks complete
+            results: list[tuple[str, tuple[str, str, str, bool] | Exception]] = []
+            for task in tqdm.as_completed(tasks, total=len(urls_to_process), desc=desc, unit="doc"):
+                results.append(await task)
+
+            # Update all_results and collect failed URLs for retry
+            failed_urls = []
+            for original_url, outcome in results:
+                if isinstance(outcome, Exception):
+                    # Only retry if not already succeeded
+                    if original_url not in all_results or isinstance(all_results.get(original_url), Exception):
+                        all_results[original_url] = outcome
+                        failed_urls.append(original_url)
+                else:
+                    # Success - update result
+                    all_results[original_url] = outcome
+
+            # Prepare for next retry round
+            urls_to_process = failed_urls
+
+            # Add small delay before retry to avoid hammering sites
+            if urls_to_process and retry_round < MAX_RETRY_ROUNDS:
+                await asyncio.sleep(2)
+
+    # Report final results
     ok = 0
+    failed = 0
     print()  # Add newline after progress bar
-    for url, result in zip(urls, results):
-        if isinstance(result, Exception):
-            print(f"[FAIL] {url} -> {result}", file=sys.stderr)
-        else:
-            ok += 1
-            original_url, doc_url, doc_title, used_title = result
-            note = "title" if used_title else "fallback"
-            print(f'[OK] || "{doc_title}" || ({note}) || {original_url} -> {doc_url}')
 
-    print(f"\n✓ Done: {ok}/{len(urls)} succeeded.")
+    for original_url in urls:
+        outcome = all_results.get(original_url)
+        if isinstance(outcome, Exception):
+            failed += 1
+            print(f"[FAIL] || {original_url} || {outcome}", file=sys.stderr)
+            continue
+
+        ok += 1
+        _, doc_url, doc_title, used_title = outcome
+        note = "title" if used_title else "fallback"
+        print(f'[OK] || "{doc_title}" || ({note}) || {original_url} -> {doc_url}')
+
+    print(f"\n✓ Done: {ok}/{len(urls)} succeeded, {failed} failed.")
+    if failed > 0 and retry_round >= MAX_RETRY_ROUNDS:
+        print(f"  (Failed URLs were retried {MAX_RETRY_ROUNDS - 1} times)", file=sys.stderr)
 
 
 if __name__ == "__main__":
