@@ -6,3 +6,6 @@ google-auth-httplib2>=0.2.0
 google-api-python-client>=2.149.0
 markdown-it-py>=3.0.0
 trafilatura>=1.12.0
+playwright>=1.40.0
+lxml>=5.0.0
+html2text>=2020.1.16
