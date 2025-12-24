@@ -49,9 +49,9 @@ def sanitize_doc_title(name: str) -> str:
     return name or "Untitled"
 
 
-def check_existing_doc(drive_service, folder_id: str, title: str) -> str:
+def _check_existing_doc_sync(drive_service, folder_id: str, title: str) -> str:
     """
-    Check if a document with the given title exists in the folder.
+    Synchronous helper: Check if a document with the given title exists in the folder.
     If it exists, return a unique title by appending (2), (3), etc.
 
     Args:
@@ -107,8 +107,10 @@ async def create_google_doc(markdown_content: str, title: str, folder_id: str) -
         docs_service = get_docs_service()
         drive_service = get_drive_service()
 
-        # Check for existing docs and get unique title
-        unique_title = check_existing_doc(drive_service, folder_id, title)
+        # Check for existing docs and get unique title (run in thread pool)
+        unique_title = await asyncio.to_thread(
+            _check_existing_doc_sync, drive_service, folder_id, title
+        )
 
         # Create a blank Google Doc without parent (avoids quota issues)
         file_metadata = {
@@ -116,26 +118,32 @@ async def create_google_doc(markdown_content: str, title: str, folder_id: str) -
             'mimeType': 'application/vnd.google-apps.document'
         }
 
-        doc = drive_service.files().create(body=file_metadata, fields='id').execute()
+        doc = await asyncio.to_thread(
+            lambda: drive_service.files().create(body=file_metadata, fields='id').execute()
+        )
         doc_id = doc['id']
 
         # Move it to the target folder and transfer ownership to you
-        drive_service.files().update(
-            fileId=doc_id,
-            addParents=folder_id,
-            removeParents='root',
-            fields='id, parents'
-        ).execute()
+        await asyncio.to_thread(
+            lambda: drive_service.files().update(
+                fileId=doc_id,
+                addParents=folder_id,
+                removeParents='root',
+                fields='id, parents'
+            ).execute()
+        )
 
         # Convert markdown to Docs API requests
         requests = convert_markdown_to_doc_requests(markdown_content)
 
         # Apply all formatting in a single batchUpdate
         if requests:
-            docs_service.documents().batchUpdate(
-                documentId=doc_id,
-                body={'requests': requests}
-            ).execute()
+            await asyncio.to_thread(
+                lambda: docs_service.documents().batchUpdate(
+                    documentId=doc_id,
+                    body={'requests': requests}
+                ).execute()
+            )
 
         # Return shareable URL
         return f"https://docs.google.com/document/d/{doc_id}/edit"
@@ -452,8 +460,7 @@ async def process_url(
         # Launch both fetch methods in parallel
         async def fetch_aiohttp():
             try:
-                async with semaphore:
-                    return await fetch_markdown(session, original_url)
+                return await fetch_markdown(session, original_url)
             except Exception as e:
                 return (None, None, e)
 
@@ -522,8 +529,7 @@ async def process_url(
 
     else:
         # Playwright not available, use aiohttp only
-        async with semaphore:
-            html, md_traf = await fetch_markdown(session, original_url)
+        html, md_traf = await fetch_markdown(session, original_url)
 
         # Try both trafilatura and multi-div
         results = []
@@ -567,10 +573,11 @@ async def process_url_safe(
     playwright_sem: asyncio.Semaphore | None
 ) -> tuple[str, tuple[str, str, str, bool, str, int] | Exception]:
     try:
-        return (original_url, await process_url(
-            session, original_url, folder_id, semaphore,
-            browser, playwright_sem
-        ))
+        async with semaphore:
+            return (original_url, await process_url(
+                session, original_url, folder_id, semaphore,
+                browser, playwright_sem
+            ))
     except Exception as e:
         return (original_url, e)
 
@@ -626,10 +633,12 @@ async def main(urls: list[str]) -> None:
                     for u in urls_to_process
                 ]
 
-                # Use tqdm to show progress bar as tasks complete
-                results: list[tuple[str, tuple[str, str, str, bool, bool] | Exception]] = []
-                for task in tqdm.as_completed(tasks, total=len(urls_to_process), desc=desc, unit="doc"):
-                    results.append(await task)
+                # Run all tasks concurrently with progress bar
+                results: list[tuple[str, tuple[str, str, str, bool, str, int] | Exception]] = []
+                with tqdm(total=len(urls_to_process), desc=desc, unit="doc") as pbar:
+                    for coro in asyncio.as_completed(tasks):
+                        results.append(await coro)
+                        pbar.update(1)
 
                 # Update all_results and collect failed URLs for retry
                 failed_urls = []
