@@ -8,7 +8,7 @@ A powerful Python CLI tool that fetches web content and automatically creates fo
 
 - **Intelligent dual extraction** - runs both aiohttp and Playwright in parallel, uses longest result
 - **Multi-method content extraction** - combines trafilatura and multi-div extraction for maximum completeness
-- **High concurrency** - processes 15 URLs simultaneously (configurable)
+- **Concurrent processing** - fetches up to 15 URLs in parallel, ~2x faster than sequential (configurable)
 - **Google Docs integration** - automatically creates formatted documents in your Drive
 - **Smart formatting** - converts markdown to native Google Docs formatting (headings, bold, italic, links, lists)
 
@@ -195,6 +195,10 @@ web-content-parser/
 ### Performance Settings
 
 - **Concurrency**: 15 parallel tasks (both aiohttp and Playwright)
+  - **Note**: While fetching runs fully in parallel, Google API operations have inherent rate limiting
+  - **Actual speedup**: ~2x faster than sequential processing (not 15x)
+  - **Why**: Google Docs/Drive APIs have connection pooling and rate limits that serialize some operations
+  - **Benefit**: Still significantly faster, and content fetching (the slowest part) is fully parallelized
 - **Timeout**: 30s for aiohttp, 45s for Playwright
 - **Retries**: 2 per-URL retries + 3 batch-level retry rounds
 - **Target folder**: "Resources" in Google Drive (customizable in `fetch_markdown.py`)
