@@ -4,6 +4,7 @@ Web Content Parser - Fetch markdown versions of web pages and create Google Docs
 import asyncio
 import re
 import sys
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 import aiohttp
@@ -49,46 +50,77 @@ def sanitize_doc_title(name: str) -> str:
     return name or "Untitled"
 
 
-def _check_existing_doc_sync(drive_service, folder_id: str, title: str) -> str:
+def _find_existing_doc_id_recursive_sync(
+    drive_service,
+    root_folder_id: str,
+    title: str
+) -> str | None:
     """
-    Synchronous helper: Check if a document with the given title exists in the folder.
-    If it exists, return a unique title by appending (2), (3), etc.
+    Synchronous helper: Recursively search for a document by title in a folder
+    and all nested subfolders.
 
     Args:
         drive_service: Authenticated Google Drive service
-        folder_id: ID of the folder to search in
-        title: Proposed document title
+        root_folder_id: ID of the root folder to search in
+        title: Document title to find
 
     Returns:
-        str: Unique document title
+        str | None: Document ID if found, otherwise None
     """
-    base_title = title
-    counter = 2
+    escaped_title = title.replace("'", "\\'")
+    doc_query_template = (
+        "name='{title}' and '{folder_id}' in parents and "
+        "mimeType='application/vnd.google-apps.document' and trashed=false"
+    )
+    folder_query_template = (
+        "'{folder_id}' in parents and "
+        "mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
 
-    while True:
-        # Search for exact title match in the folder
-        # Escape single quotes in title for Drive API query
-        escaped_title = title.replace("'", "\\'")
-        query = f"name='{escaped_title}' and '{folder_id}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false"
-        results = drive_service.files().list(
-            q=query,
+    queue = deque([root_folder_id])
+    visited = set()
+
+    while queue:
+        folder_id = queue.popleft()
+        if folder_id in visited:
+            continue
+        visited.add(folder_id)
+
+        # Check for a matching document in this folder
+        doc_query = doc_query_template.format(title=escaped_title, folder_id=folder_id)
+        doc_results = drive_service.files().list(
+            q=doc_query,
             spaces='drive',
             fields='files(id, name)',
             pageSize=1
         ).execute()
 
-        files = results.get('files', [])
+        doc_files = doc_results.get('files', [])
+        if doc_files:
+            return doc_files[0].get('id')
 
-        if not files:
-            # Title is unique
-            return title
+        # Queue subfolders
+        page_token = None
+        while True:
+            folder_query = folder_query_template.format(folder_id=folder_id)
+            folder_results = drive_service.files().list(
+                q=folder_query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
 
-        # Title exists, try next number
-        title = f"{base_title} ({counter})"
-        counter += 1
+            for folder in folder_results.get('files', []):
+                folder_id_child = folder.get('id')
+                if folder_id_child:
+                    queue.append(folder_id_child)
 
-        if counter > 100:  # Safety limit
-            raise RuntimeError(f"Too many documents with similar titles: {base_title}")
+            page_token = folder_results.get('nextPageToken')
+            if not page_token:
+                break
+
+    return None
 
 
 async def create_google_doc(markdown_content: str, title: str, folder_id: str) -> str:
@@ -107,14 +139,19 @@ async def create_google_doc(markdown_content: str, title: str, folder_id: str) -
         docs_service = get_docs_service()
         drive_service = get_drive_service()
 
-        # Check for existing docs and get unique title (run in thread pool)
-        unique_title = await asyncio.to_thread(
-            _check_existing_doc_sync, drive_service, folder_id, title
+        # Check for existing docs by title in the folder and all subfolders
+        existing_doc_id = await asyncio.to_thread(
+            _find_existing_doc_id_recursive_sync, drive_service, folder_id, title
         )
+
+        if existing_doc_id:
+            # Document already exists, return its URL
+            print(f"↺ Existing doc found for '{title}', reusing.", file=sys.stderr)
+            return f"https://docs.google.com/document/d/{existing_doc_id}/edit"
 
         # Create a blank Google Doc without parent (avoids quota issues)
         file_metadata = {
-            'name': unique_title,
+            'name': title,
             'mimeType': 'application/vnd.google-apps.document'
         }
 
