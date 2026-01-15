@@ -11,6 +11,8 @@ A powerful Python CLI tool that fetches web content and automatically creates fo
 - **Concurrent processing** - fetches up to 15 URLs in parallel, ~2x faster than sequential (configurable)
 - **Google Docs integration** - automatically creates formatted documents in your Drive
 - **Smart formatting** - converts markdown to native Google Docs formatting (headings, bold, italic, links, lists)
+- **Source + title header** - inserts the document title (Docs TITLE style) and clickable source URL at the top
+- **Drive reuse with cache** - reuses existing Docs by title across nested folders with a one-time cache build
 
 ### Content Extraction
 
@@ -24,7 +26,7 @@ A powerful Python CLI tool that fetches web content and automatically creates fo
 
 - **Automatic retry** - failed URLs retry up to 3 rounds with exponential backoff
 - **Automatic title extraction** - from metadata, H1 headings, or URL fallback
-- **Duplicate detection** - adds (2), (3) suffixes for docs with same title
+- **Duplicate avoidance** - reuses existing Docs when a matching title already exists (recursive Drive search)
 - **Real-time progress bar** - shows completion status, speed, and extraction method used
 - **Detailed logging** - shows extraction method, content length, and document title for each URL
 - **OAuth authentication** - one-time browser login, then automatic for future runs
@@ -172,7 +174,9 @@ All Google Docs are created in your **Resources** folder with:
 
 - Native Google Docs formatting (not plain text)
 - Proper headings, bold, italic, links, lists, code blocks
-- Duplicate handling: `Title`, `Title (2)`, `Title (3)`, etc.
+- Top of doc includes:
+  - Document title styled as **Google Docs TITLE**
+  - Clickable **Source** link on the next line
 - Content from whichever extraction method got the most text
 
 ## Project Structure
@@ -202,6 +206,7 @@ web-content-parser/
 - **Timeout**: 30s for aiohttp, 45s for Playwright
 - **Retries**: 2 per-URL retries + 3 batch-level retry rounds
 - **Target folder**: "Resources" in Google Drive (customizable in `fetch_markdown.py`)
+- **Startup cost**: one-time Drive cache build (faster reuse on larger batches)
 
 ### Extraction Strategy
 
@@ -264,9 +269,11 @@ Sensitive files are excluded from git via `.gitignore`:
 
 ### 5. **Document Creation**:
 
+- Builds a one-time Drive title cache (recursive folder scan)
+- Reuses existing Docs by title if found; otherwise creates a new document
 - Parses markdown with `markdown-it-py`
 - Converts to Google Docs API `batchUpdate` requests
-- Creates doc via Drive API (bypasses service account quota issues)
+- Inserts the document title as **TITLE** and the clickable **Source** link at top
 - Applies formatting with Docs API in single batch operation
 
 ### 6. **Formatting** (`docs_converter.py`):
