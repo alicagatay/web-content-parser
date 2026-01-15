@@ -265,7 +265,7 @@ async def create_google_doc(
         )
 
         # Convert markdown to Docs API requests
-        requests = convert_markdown_to_doc_requests(markdown_content)
+        requests = convert_markdown_to_doc_requests(markdown_content, doc_title=title)
 
         # Apply all formatting in a single batchUpdate
         if requests:
