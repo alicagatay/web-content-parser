@@ -558,8 +558,11 @@ async def process_url(
     else:
         doc_title = sanitize_doc_title(fallback_name_from_url(original_url))
 
+    # Add source URL at top as a clickable link
+    md_with_source = f"Source: [{original_url}]({original_url})\n\n{md}"
+
     # Create Google Doc
-    doc_url = await create_google_doc(md, doc_title, folder_id)
+    doc_url = await create_google_doc(md_with_source, doc_title, folder_id)
 
     return (original_url, doc_url, doc_title, used_metadata or bool(title), extraction_method, content_length)
 
