@@ -13,7 +13,7 @@ class MarkdownToDocsConverter:
     Uses reverse insertion strategy to maintain correct indices
     """
 
-    def __init__(self, markdown_text):
+    def __init__(self, markdown_text, doc_title: str | None = None):
         """
         Initialize converter with markdown text
 
@@ -21,6 +21,7 @@ class MarkdownToDocsConverter:
             markdown_text: Raw markdown content to convert
         """
         self.markdown = markdown_text
+        self.doc_title = doc_title
         self.md_parser = MarkdownIt()
         self.tokens = self.md_parser.parse(markdown_text)
         self.requests = []
@@ -35,6 +36,15 @@ class MarkdownToDocsConverter:
         """
         # First pass: collect all content and calculate final length
         content_parts = self._extract_content_parts(self.tokens)
+
+        # Prepend document title as a TITLE-styled paragraph if provided
+        if self.doc_title:
+            title_part = {
+                'text': f"{self.doc_title}\n",
+                'named_style': 'TITLE',
+                'inline_formats': []
+            }
+            content_parts = [title_part] + content_parts
 
         # Build all text first
         full_text = self._build_full_text(content_parts)
@@ -56,8 +66,18 @@ class MarkdownToDocsConverter:
             start_index = current_pos
             end_index = start_index + len(part['text'])
 
-            # Apply paragraph style (headings)
-            if part.get('heading_level'):
+            # Apply paragraph style (named styles or headings)
+            if part.get('named_style'):
+                requests.append({
+                    'updateParagraphStyle': {
+                        'range': {'startIndex': start_index, 'endIndex': end_index},
+                        'paragraphStyle': {
+                            'namedStyleType': part['named_style']
+                        },
+                        'fields': 'namedStyleType'
+                    }
+                })
+            elif part.get('heading_level'):
                 requests.append({
                     'updateParagraphStyle': {
                         'range': {'startIndex': start_index, 'endIndex': end_index},
@@ -315,15 +335,16 @@ class MarkdownToDocsConverter:
         return ''.join(part['text'] for part in content_parts)
 
 
-def convert_markdown_to_doc_requests(markdown_text):
+def convert_markdown_to_doc_requests(markdown_text, doc_title: str | None = None):
     """
     Convert markdown text to Google Docs API batch update requests
 
     Args:
         markdown_text: Raw markdown content
+        doc_title: Optional document title to render as Google Docs TITLE
 
     Returns:
         list: List of requests for the batchUpdate API
     """
-    converter = MarkdownToDocsConverter(markdown_text)
+    converter = MarkdownToDocsConverter(markdown_text, doc_title=doc_title)
     return converter.convert()
