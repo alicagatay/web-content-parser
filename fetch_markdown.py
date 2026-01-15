@@ -123,7 +123,93 @@ def _find_existing_doc_id_recursive_sync(
     return None
 
 
-async def create_google_doc(markdown_content: str, title: str, folder_id: str) -> str:
+def _build_doc_title_cache_sync(
+    drive_service,
+    root_folder_id: str
+) -> dict[str, str]:
+    """
+    Synchronous helper: Build a cache of document titles to IDs by
+    recursively traversing the root folder and all subfolders.
+
+    Args:
+        drive_service: Authenticated Google Drive service
+        root_folder_id: ID of the root folder to search in
+
+    Returns:
+        dict[str, str]: Mapping of document title -> document ID
+    """
+    doc_cache: dict[str, str] = {}
+    folder_query_template = (
+        "'{folder_id}' in parents and "
+        "mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    doc_query_template = (
+        "'{folder_id}' in parents and "
+        "mimeType='application/vnd.google-apps.document' and trashed=false"
+    )
+
+    queue = deque([root_folder_id])
+    visited = set()
+
+    while queue:
+        folder_id = queue.popleft()
+        if folder_id in visited:
+            continue
+        visited.add(folder_id)
+
+        # List documents in this folder
+        page_token = None
+        while True:
+            doc_query = doc_query_template.format(folder_id=folder_id)
+            doc_results = drive_service.files().list(
+                q=doc_query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+
+            for doc in doc_results.get('files', []):
+                doc_id = doc.get('id')
+                doc_name = doc.get('name')
+                if doc_id and doc_name and doc_name not in doc_cache:
+                    doc_cache[doc_name] = doc_id
+
+            page_token = doc_results.get('nextPageToken')
+            if not page_token:
+                break
+
+        # Queue subfolders
+        page_token = None
+        while True:
+            folder_query = folder_query_template.format(folder_id=folder_id)
+            folder_results = drive_service.files().list(
+                q=folder_query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+
+            for folder in folder_results.get('files', []):
+                folder_id_child = folder.get('id')
+                if folder_id_child:
+                    queue.append(folder_id_child)
+
+            page_token = folder_results.get('nextPageToken')
+            if not page_token:
+                break
+
+    return doc_cache
+
+
+async def create_google_doc(
+    markdown_content: str,
+    title: str,
+    folder_id: str,
+    doc_cache: dict[str, str] | None = None,
+    cache_lock: asyncio.Lock | None = None
+) -> str:
     """
     Create a Google Doc from markdown content
 
@@ -139,10 +225,18 @@ async def create_google_doc(markdown_content: str, title: str, folder_id: str) -
         docs_service = get_docs_service()
         drive_service = get_drive_service()
 
-        # Check for existing docs by title in the folder and all subfolders
-        existing_doc_id = await asyncio.to_thread(
-            _find_existing_doc_id_recursive_sync, drive_service, folder_id, title
-        )
+        existing_doc_id = None
+        if doc_cache is not None:
+            if cache_lock:
+                async with cache_lock:
+                    existing_doc_id = doc_cache.get(title)
+            else:
+                existing_doc_id = doc_cache.get(title)
+        else:
+            # Fallback: recursive search for existing doc by title
+            existing_doc_id = await asyncio.to_thread(
+                _find_existing_doc_id_recursive_sync, drive_service, folder_id, title
+            )
 
         if existing_doc_id:
             # Document already exists, return its URL
@@ -181,6 +275,14 @@ async def create_google_doc(markdown_content: str, title: str, folder_id: str) -
                     body={'requests': requests}
                 ).execute()
             )
+
+        # Update cache with the newly created doc
+        if doc_cache is not None:
+            if cache_lock:
+                async with cache_lock:
+                    doc_cache.setdefault(title, doc_id)
+            else:
+                doc_cache.setdefault(title, doc_id)
 
         # Return shareable URL
         return f"https://docs.google.com/document/d/{doc_id}/edit"
@@ -478,7 +580,9 @@ async def process_url(
     folder_id: str,
     semaphore: asyncio.Semaphore,
     browser: Browser | None,
-    playwright_sem: asyncio.Semaphore | None
+    playwright_sem: asyncio.Semaphore | None,
+    doc_cache: dict[str, str] | None,
+    cache_lock: asyncio.Lock | None
 ) -> tuple[str, str, str, bool, str, int]:
     """
     Process a single URL: fetch HTML, extract markdown, create Google Doc.
@@ -599,7 +703,13 @@ async def process_url(
     md_with_source = f"Source: [{original_url}]({original_url})\n\n{md}"
 
     # Create Google Doc
-    doc_url = await create_google_doc(md_with_source, doc_title, folder_id)
+    doc_url = await create_google_doc(
+        md_with_source,
+        doc_title,
+        folder_id,
+        doc_cache=doc_cache,
+        cache_lock=cache_lock
+    )
 
     return (original_url, doc_url, doc_title, used_metadata or bool(title), extraction_method, content_length)
 
@@ -610,13 +720,15 @@ async def process_url_safe(
     folder_id: str,
     semaphore: asyncio.Semaphore,
     browser: Browser | None,
-    playwright_sem: asyncio.Semaphore | None
+    playwright_sem: asyncio.Semaphore | None,
+    doc_cache: dict[str, str] | None,
+    cache_lock: asyncio.Lock | None
 ) -> tuple[str, tuple[str, str, str, bool, str, int] | Exception]:
     try:
         async with semaphore:
             return (original_url, await process_url(
                 session, original_url, folder_id, semaphore,
-                browser, playwright_sem
+                browser, playwright_sem, doc_cache, cache_lock
             ))
     except Exception as e:
         return (original_url, e)
@@ -650,6 +762,19 @@ async def main(urls: list[str]) -> None:
     urls_to_process = list(urls)
     retry_round = 0
 
+    # Build a doc title cache once per run to avoid repeated recursive searches
+    try:
+        drive_service = get_drive_service()
+        doc_cache = await asyncio.to_thread(
+            _build_doc_title_cache_sync, drive_service, folder_id
+        )
+        cache_lock = asyncio.Lock()
+        print(f"✓ Cached {len(doc_cache)} existing docs from Drive", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: Failed to build doc cache, falling back to recursive lookups: {e}", file=sys.stderr)
+        doc_cache = None
+        cache_lock = None
+
     # Launch Playwright browser
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -668,7 +793,7 @@ async def main(urls: list[str]) -> None:
                 tasks = [
                     asyncio.create_task(process_url_safe(
                         session, u, folder_id, semaphore,
-                        browser, playwright_sem
+                        browser, playwright_sem, doc_cache, cache_lock
                     ))
                     for u in urls_to_process
                 ]
