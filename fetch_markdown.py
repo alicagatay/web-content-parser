@@ -126,7 +126,7 @@ def _find_existing_doc_id_recursive_sync(
 def _build_doc_title_cache_sync(
     drive_service,
     root_folder_id: str
-) -> dict[str, str]:
+) -> dict[str, tuple[str, bool]]:
     """
     Synchronous helper: Build a cache of document titles to IDs by
     recursively traversing the root folder and all subfolders.
@@ -136,9 +136,9 @@ def _build_doc_title_cache_sync(
         root_folder_id: ID of the root folder to search in
 
     Returns:
-        dict[str, str]: Mapping of document title -> document ID
+        dict[str, tuple[str, bool]]: Mapping of document title -> (document ID, created_this_run)
     """
-    doc_cache: dict[str, str] = {}
+    doc_cache: dict[str, tuple[str, bool]] = {}
     folder_query_template = (
         "'{folder_id}' in parents and "
         "mimeType='application/vnd.google-apps.folder' and trashed=false"
@@ -173,7 +173,7 @@ def _build_doc_title_cache_sync(
                 doc_id = doc.get('id')
                 doc_name = doc.get('name')
                 if doc_id and doc_name and doc_name not in doc_cache:
-                    doc_cache[doc_name] = doc_id
+                    doc_cache[doc_name] = (doc_id, False)
 
             page_token = doc_results.get('nextPageToken')
             if not page_token:
@@ -207,7 +207,7 @@ async def create_google_doc(
     markdown_content: str,
     title: str,
     folder_id: str,
-    doc_cache: dict[str, str] | None = None,
+    doc_cache: dict[str, tuple[str, bool]] | None = None,
     cache_lock: asyncio.Lock | None = None
 ) -> str:
     """
@@ -226,43 +226,59 @@ async def create_google_doc(
         drive_service = get_drive_service()
 
         existing_doc_id = None
+        created_this_run = False
         if doc_cache is not None:
             if cache_lock:
                 async with cache_lock:
-                    existing_doc_id = doc_cache.get(title)
+                    cached = doc_cache.get(title)
             else:
-                existing_doc_id = doc_cache.get(title)
+                cached = doc_cache.get(title)
+            if cached:
+                existing_doc_id, created_this_run = cached
         else:
             # Fallback: recursive search for existing doc by title
             existing_doc_id = await asyncio.to_thread(
                 _find_existing_doc_id_recursive_sync, drive_service, folder_id, title
             )
 
-        if existing_doc_id:
-            # Document already exists, return its URL
+        if existing_doc_id and not created_this_run:
+            # Document already exists from a previous run, return its URL
             print(f"↺ Existing doc found for '{title}', reusing.", file=sys.stderr)
             return f"https://docs.google.com/document/d/{existing_doc_id}/edit"
 
-        # Create a blank Google Doc without parent (avoids quota issues)
-        file_metadata = {
-            'name': title,
-            'mimeType': 'application/vnd.google-apps.document'
-        }
+        if existing_doc_id and created_this_run:
+            # Reuse the doc created in this run (likely from a previous failed attempt)
+            doc_id = existing_doc_id
+        else:
+            # Create a blank Google Doc without parent (avoids quota issues)
+            file_metadata = {
+                'name': title,
+                'mimeType': 'application/vnd.google-apps.document'
+            }
 
-        doc = await asyncio.to_thread(
-            lambda: drive_service.files().create(body=file_metadata, fields='id').execute()
-        )
-        doc_id = doc['id']
+            doc = await asyncio.to_thread(
+                lambda: drive_service.files().create(body=file_metadata, fields='id').execute()
+            )
+            doc_id = doc['id']
 
-        # Move it to the target folder and transfer ownership to you
-        await asyncio.to_thread(
-            lambda: drive_service.files().update(
-                fileId=doc_id,
-                addParents=folder_id,
-                removeParents='root',
-                fields='id, parents'
-            ).execute()
-        )
+        # Update cache immediately to prevent duplicate docs on retries
+        if doc_cache is not None:
+            if cache_lock:
+                async with cache_lock:
+                    doc_cache[title] = (doc_id, True)
+            else:
+                doc_cache[title] = (doc_id, True)
+
+        if not (existing_doc_id and created_this_run):
+            # Move it to the target folder and transfer ownership to you
+            await asyncio.to_thread(
+                lambda: drive_service.files().update(
+                    fileId=doc_id,
+                    addParents=folder_id,
+                    removeParents='root',
+                    fields='id, parents'
+                ).execute()
+            )
 
         # Convert markdown to Docs API requests
         requests = convert_markdown_to_doc_requests(markdown_content, doc_title=title)
@@ -280,9 +296,9 @@ async def create_google_doc(
         if doc_cache is not None:
             if cache_lock:
                 async with cache_lock:
-                    doc_cache.setdefault(title, doc_id)
+                    doc_cache[title] = (doc_id, False)
             else:
-                doc_cache.setdefault(title, doc_id)
+                doc_cache[title] = (doc_id, False)
 
         # Return shareable URL
         return f"https://docs.google.com/document/d/{doc_id}/edit"
@@ -581,7 +597,7 @@ async def process_url(
     semaphore: asyncio.Semaphore,
     browser: Browser | None,
     playwright_sem: asyncio.Semaphore | None,
-    doc_cache: dict[str, str] | None,
+    doc_cache: dict[str, tuple[str, bool]] | None,
     cache_lock: asyncio.Lock | None
 ) -> tuple[str, str, str, bool, str, int]:
     """
@@ -721,7 +737,7 @@ async def process_url_safe(
     semaphore: asyncio.Semaphore,
     browser: Browser | None,
     playwright_sem: asyncio.Semaphore | None,
-    doc_cache: dict[str, str] | None,
+    doc_cache: dict[str, tuple[str, bool]] | None,
     cache_lock: asyncio.Lock | None
 ) -> tuple[str, tuple[str, str, str, bool, str, int] | Exception]:
     try:
