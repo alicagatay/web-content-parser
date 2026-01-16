@@ -4,6 +4,7 @@ Web Content Parser - Fetch markdown versions of web pages and create Google Docs
 import asyncio
 import re
 import sys
+from datetime import datetime
 from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
@@ -715,8 +716,13 @@ async def process_url(
     else:
         doc_title = sanitize_doc_title(fallback_name_from_url(original_url))
 
-    # Add source URL at top as a clickable link
-    md_with_source = f"Source: [{original_url}]({original_url})\n\n{md}"
+    # Add source URL and timestamp at top as plain text lines
+    timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    md_with_source = (
+        f"Source: [{original_url}]({original_url})\n\n"
+        f"Date of Addition: {timestamp}\n\n"
+        f"{md}"
+    )
 
     # Create Google Doc
     doc_url = await create_google_doc(
