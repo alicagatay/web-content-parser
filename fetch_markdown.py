@@ -44,7 +44,7 @@ class ExtractionConfig:
     pruning_threshold: float = 0.48
 
     # Minimum word count for blocks (in final markdown filtering)
-    min_words: int = 50
+    min_words: int = 0
 
     # Minimum word count for pruning filter
     min_word_threshold: int = 10
@@ -1185,9 +1185,9 @@ Configuration:
     parser.add_argument(
         '--min-words',
         type=int,
-        default=50,
+        default=0,
         metavar='INT',
-        help='Minimum words per markdown block. Default: 50'
+        help='Minimum words per markdown block. Default: 0 (disabled)'
     )
 
     parser.add_argument(
