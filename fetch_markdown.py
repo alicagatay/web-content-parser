@@ -2,8 +2,10 @@
 Web Content Parser - Fetch markdown versions of web pages and create Google Docs
 """
 import asyncio
+import argparse
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -13,11 +15,42 @@ from tqdm.asyncio import tqdm
 from playwright.async_api import async_playwright, Browser, TimeoutError as PlaywrightTimeoutError
 from lxml import html as lxml_html, etree
 import html2text
+from bs4 import BeautifulSoup
 
 try:
     import trafilatura
 except Exception:  # pragma: no cover
     trafilatura = None
+
+# Import cleaning and filtering modules
+from content_filter import FilterConfig, PruningContentFilter
+from html_cleaner import (
+    clean_html_for_extraction,
+    extract_main_content,
+    filter_short_blocks,
+)
+
+
+@dataclass
+class ExtractionConfig:
+    """Configuration for content extraction."""
+    # Enable HTML cleaning before extraction
+    enable_cleaning: bool = True
+
+    # Enable content pruning/scoring
+    enable_pruning: bool = True
+
+    # Pruning threshold (0.0-1.0). Lower keeps more, higher is more aggressive
+    pruning_threshold: float = 0.48
+
+    # Minimum word count for blocks (in final markdown filtering)
+    min_words: int = 50
+
+    # Minimum word count for pruning filter
+    min_word_threshold: int = 10
+
+    # Use dynamic threshold adjustment
+    dynamic_threshold: bool = True
 
 # Import Google API modules
 from auth import get_docs_service, get_drive_service, find_folder_id
@@ -34,6 +67,9 @@ MAX_RETRY_ROUNDS = 3
 PLAYWRIGHT_CONCURRENCY = 15
 PLAYWRIGHT_TIMEOUT = 45000  # 45 seconds (in milliseconds)
 PLAYWRIGHT_RETRIES = 3      # Playwright fetch retries
+
+# Global extraction config (set by CLI args)
+EXTRACTION_CONFIG: ExtractionConfig = ExtractionConfig()
 
 
 def sanitize_doc_title(name: str) -> str:
@@ -502,6 +538,159 @@ def extract_with_multi_div(html: str) -> str | None:
         return None
 
 
+def extract_with_css_selectors(html: str, url: str | None = None) -> str | None:
+    """
+    Extract content using priority-ordered CSS selectors.
+
+    Uses common content patterns to find main content.
+
+    Args:
+        html: HTML content
+        url: Optional URL (for future use)
+
+    Returns:
+        Markdown string or None if extraction fails
+    """
+    try:
+        # Try to extract main content
+        main_content = extract_main_content(html, url)
+
+        if main_content:
+            # Convert to markdown
+            h = html2text.HTML2Text()
+            h.ignore_links = False
+            h.body_width = 0
+            md = h.handle(main_content)
+
+            if md and len(md.strip()) > 200:
+                return md.strip()
+
+        # Fallback: try common selectors manually
+        soup = BeautifulSoup(html, 'lxml')
+
+        selectors = [
+            'article.post-content',
+            'article.entry-content',
+            'article',
+            'main article',
+            '[role="main"]',
+            'main',
+            '.article-content',
+            '.post-content',
+            '.entry-content',
+            '.content-body',
+        ]
+
+        for selector in selectors:
+            try:
+                element = soup.select_one(selector)
+                if element:
+                    text = element.get_text(strip=True)
+                    if len(text) > 500:  # Minimum threshold
+                        h = html2text.HTML2Text()
+                        h.ignore_links = False
+                        h.body_width = 0
+                        md = h.handle(str(element))
+                        if md:
+                            return md.strip()
+            except Exception:
+                continue
+
+        return None
+
+    except Exception:
+        return None
+
+
+def apply_extraction_pipeline(html: str, url: str) -> tuple[str, str]:
+    """
+    Apply the full extraction pipeline: clean, prune, extract.
+
+    Returns both cleaned HTML and the HTML after pruning.
+
+    Args:
+        html: Raw HTML
+        url: Page URL
+
+    Returns:
+        Tuple of (cleaned_html, pruned_html)
+    """
+    config = EXTRACTION_CONFIG
+
+    # Step 1: Basic cleaning (remove scripts, noise elements, etc.)
+    if config.enable_cleaning:
+        cleaned_html = clean_html_for_extraction(html, url=url)
+    else:
+        cleaned_html = html
+
+    # Step 2: Content-aware pruning
+    if config.enable_pruning:
+        filter_config = FilterConfig(
+            pruning_threshold=config.pruning_threshold,
+            min_word_threshold=config.min_word_threshold,
+            dynamic_threshold=config.dynamic_threshold,
+        )
+        pruning_filter = PruningContentFilter(filter_config)
+        pruned_html = pruning_filter.filter_content(cleaned_html)
+    else:
+        pruned_html = cleaned_html
+
+    return cleaned_html, pruned_html
+
+
+async def smart_wait_for_content(page) -> None:
+    """
+    Smart waiting for dynamic content with multiple strategies.
+    """
+    # Common selectors for article content
+    content_selectors = [
+        'article',
+        'main',
+        '[role="main"]',
+        '.article-content',
+        '.post-content',
+        '.entry-content',
+        '[itemprop="articleBody"]',
+    ]
+
+    # Try each selector with short timeout
+    for selector in content_selectors:
+        try:
+            await page.wait_for_selector(selector, timeout=2000)
+            return  # Found content, done waiting
+        except Exception:
+            continue
+
+    # Fallback: wait for network to settle
+    try:
+        await page.wait_for_load_state('networkidle', timeout=5000)
+    except Exception:
+        pass
+
+    # Scroll to trigger lazy loading
+    try:
+        await page.evaluate("""
+            () => {
+                // Scroll to middle
+                window.scrollTo(0, document.body.scrollHeight / 2);
+            }
+        """)
+        await asyncio.sleep(0.5)
+
+        await page.evaluate("""
+            () => {
+                // Scroll to bottom
+                window.scrollTo(0, document.body.scrollHeight);
+            }
+        """)
+        await asyncio.sleep(0.5)
+
+        # Scroll back to top
+        await page.evaluate("() => window.scrollTo(0, 0)")
+    except Exception:
+        pass
+
+
 async def fetch_with_playwright(
     browser: Browser,
     url: str
@@ -558,16 +747,8 @@ async def fetch_with_playwright(
             # Navigate and wait for network to be mostly idle
             await page.goto(url, timeout=PLAYWRIGHT_TIMEOUT, wait_until="domcontentloaded")
 
-            # Additional wait for dynamic content to load
-            # Try waiting for article content (common selectors)
-            try:
-                await page.wait_for_selector('article, main, [role="main"], .article-content', timeout=5000)
-            except:
-                # If specific selectors don't exist, just wait a bit more
-                await asyncio.sleep(2)
-
-            # Give extra time for lazy-loaded content
-            await asyncio.sleep(1)
+            # Use smart waiting for dynamic content
+            await smart_wait_for_content(page)
 
             # Get fully rendered HTML
             html = await page.content()
@@ -603,7 +784,8 @@ async def process_url(
 ) -> tuple[str, str, str, bool, str, int]:
     """
     Process a single URL: fetch HTML, extract markdown, create Google Doc.
-    Always runs BOTH aiohttp and Playwright in parallel for maximum content extraction.
+    Uses adaptive extraction: first try without site rules, if quality is low,
+    retry with site rules and learn new rules if they help.
 
     Returns:
         (original_url, doc_url, doc_title, used_title, extraction_method, content_length)
@@ -612,8 +794,116 @@ async def process_url(
     md = None
     extraction_method = ""
     content_length = 0
+    config = EXTRACTION_CONFIG
 
-    # Always run BOTH aiohttp and Playwright in parallel (unless Playwright unavailable)
+    def run_extractions_on_html(
+        source_name: str,
+        raw_html: str,
+        url: str,
+    ) -> list[tuple[str, str, str, int]]:
+        """
+        Run all extraction strategies on HTML (raw and cleaned variants).
+        Returns list of (method_name, html, markdown, length) tuples.
+        """
+        results = []
+
+        # Apply cleaning pipeline
+        if config.enable_cleaning or config.enable_pruning:
+            cleaned_html, pruned_html = apply_extraction_pipeline(raw_html, url)
+        else:
+            cleaned_html = raw_html
+            pruned_html = raw_html
+
+        # Strategy 1: trafilatura on raw HTML
+        try:
+            md_raw_traf = trafilatura.extract(
+                raw_html,
+                include_comments=False,
+                include_tables=True,
+                include_links=True,
+                favor_recall=True,
+                output_format="markdown",
+                url=url,
+            )
+            if md_raw_traf:
+                results.append((f"{source_name}+raw+trafilatura", raw_html, md_raw_traf, len(md_raw_traf.strip())))
+        except Exception:
+            pass
+
+        # Strategy 2: trafilatura on cleaned HTML
+        if config.enable_cleaning:
+            try:
+                md_clean_traf = trafilatura.extract(
+                    cleaned_html,
+                    include_comments=False,
+                    include_tables=True,
+                    include_links=True,
+                    favor_recall=True,
+                    output_format="markdown",
+                    url=url,
+                )
+                if md_clean_traf:
+                    results.append((f"{source_name}+cleaned+trafilatura", raw_html, md_clean_traf, len(md_clean_traf.strip())))
+            except Exception:
+                pass
+
+        # Strategy 3: trafilatura on pruned HTML
+        if config.enable_pruning:
+            try:
+                md_prune_traf = trafilatura.extract(
+                    pruned_html,
+                    include_comments=False,
+                    include_tables=True,
+                    include_links=True,
+                    favor_recall=True,
+                    output_format="markdown",
+                    url=url,
+                )
+                if md_prune_traf:
+                    results.append((f"{source_name}+pruned+trafilatura", raw_html, md_prune_traf, len(md_prune_traf.strip())))
+            except Exception:
+                pass
+
+        # Strategy 4: multi-div on raw HTML
+        try:
+            md_multi = extract_with_multi_div(raw_html)
+            if md_multi:
+                results.append((f"{source_name}+raw+multi-div", raw_html, md_multi, len(md_multi.strip())))
+        except Exception:
+            pass
+
+        # Strategy 5: multi-div on cleaned HTML
+        if config.enable_cleaning:
+            try:
+                md_multi_clean = extract_with_multi_div(cleaned_html)
+                if md_multi_clean:
+                    results.append((f"{source_name}+cleaned+multi-div", raw_html, md_multi_clean, len(md_multi_clean.strip())))
+            except Exception:
+                pass
+
+        # Strategy 6: CSS-targeted extraction on cleaned HTML
+        try:
+            md_css = extract_with_css_selectors(
+                cleaned_html if config.enable_cleaning else raw_html,
+                url,
+            )
+            if md_css:
+                results.append((f"{source_name}+css-targeted", raw_html, md_css, len(md_css.strip())))
+        except Exception:
+            pass
+
+        return results
+
+    def select_best_result(results: list[tuple[str, str, str, int]]) -> tuple[str, str, str, int] | None:
+        """Select the best extraction result by content length."""
+        if not results:
+            return None
+        return max(results, key=lambda x: x[3])
+
+    # Fetch HTML from both sources
+    aiohttp_html = None
+    playwright_html = None
+
     if browser and playwright_sem:
         # Launch both fetch methods in parallel
         async def fetch_aiohttp():
@@ -635,45 +925,14 @@ async def process_url(
             fetch_playwright_wrapper()
         )
 
-        # Process aiohttp results - track both trafilatura and multi-div separately
-        aiohttp_results = []
+        # Extract HTML from results
         if len(aiohttp_result) == 2:  # Success case
-            aiohttp_html, aiohttp_md_traf = aiohttp_result
-            if aiohttp_md_traf:
-                aiohttp_results.append(("aiohttp+trafilatura", aiohttp_html, aiohttp_md_traf, len(aiohttp_md_traf.strip())))
+            aiohttp_html, _ = aiohttp_result
 
-            # Try multi-div extraction on aiohttp HTML
-            aiohttp_md_multi = extract_with_multi_div(aiohttp_html)
-            if aiohttp_md_multi:
-                aiohttp_results.append(("aiohttp+multi-div", aiohttp_html, aiohttp_md_multi, len(aiohttp_md_multi.strip())))
-
-        # Process Playwright results - track both trafilatura and multi-div separately
-        playwright_results = []
         if not isinstance(playwright_html_result, tuple):  # Success case (got HTML string)
             playwright_html = playwright_html_result
 
-            # Extract using trafilatura
-            pw_md_traf = trafilatura.extract(
-                playwright_html,
-                include_comments=False,
-                include_tables=True,
-                include_links=True,
-                favor_recall=True,
-                output_format="markdown",
-                url=original_url,
-            )
-            if pw_md_traf:
-                playwright_results.append(("playwright+trafilatura", playwright_html, pw_md_traf, len(pw_md_traf.strip())))
-
-            # Extract using multi-div
-            pw_md_multi = extract_with_multi_div(playwright_html)
-            if pw_md_multi:
-                playwright_results.append(("playwright+multi-div", playwright_html, pw_md_multi, len(pw_md_multi.strip())))
-
-        # Compare ALL results (all 4 possible combinations) and use the longest
-        all_results = aiohttp_results + playwright_results
-
-        if not all_results:
+        if not aiohttp_html and not playwright_html:
             # Both methods failed
             if len(aiohttp_result) == 3:  # aiohttp exception
                 raise aiohttp_result[2]
@@ -681,28 +940,32 @@ async def process_url(
                 raise playwright_html_result[1]
             else:
                 raise RuntimeError("Both aiohttp and Playwright failed to extract content")
-
-        # Use the longest result
-        extraction_method, html, md, content_length = max(all_results, key=lambda x: x[3])
-
     else:
         # Playwright not available, use aiohttp only
-        html, md_traf = await fetch_markdown(session, original_url)
+        aiohttp_html, _ = await fetch_markdown(session, original_url)
 
-        # Try both trafilatura and multi-div
-        results = []
-        if md_traf:
-            results.append(("aiohttp+trafilatura", md_traf, len(md_traf.strip())))
+    # Run extraction on all available HTML sources
+    all_results = []
+    if aiohttp_html:
+        all_results.extend(run_extractions_on_html("aiohttp", aiohttp_html, original_url))
+    if playwright_html:
+        all_results.extend(run_extractions_on_html("playwright", playwright_html, original_url))
 
-        md_multi = extract_with_multi_div(html)
-        if md_multi:
-            results.append(("aiohttp+multi-div", md_multi, len(md_multi.strip())))
+    # Select best result
+    result = select_best_result(all_results)
 
-        if not results:
-            raise RuntimeError("Content extraction failed")
+    if not result:
+        raise RuntimeError("Content extraction failed")
 
-        # Use whichever got more content
-        extraction_method, md, content_length = max(results, key=lambda x: x[2])
+    extraction_method, html, md, content_length = result
+
+    if not md:
+        raise RuntimeError("Content extraction failed")
+
+    # Apply final markdown filtering (remove short blocks)
+    if config.min_words > 0:
+        md = filter_short_blocks(md, min_words=config.min_words)
+        content_length = len(md.strip())
 
     # Try to extract title: metadata → H1 → URL fallback
     title = extract_title_from_metadata(html, original_url)
@@ -874,13 +1137,95 @@ async def main(urls: list[str]) -> None:
         print(f"  (Failed URLs were retried {MAX_RETRY_ROUNDS - 1} times)", file=sys.stderr)
 
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Fetch web pages, extract content as markdown, and create Google Docs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python fetch_markdown.py "https://example.com/article"
+  python fetch_markdown.py --no-clean "https://example.com/article"
+  python fetch_markdown.py --pruning-threshold 0.6 --min-words 30 url1 url2
+
+Configuration:
+  The extraction pipeline cleans HTML and prunes low-quality content by default.
+  Use --no-clean and --no-prune to disable these features for faster processing.
+        """
+    )
+
+    parser.add_argument(
+        'urls',
+        nargs='+',
+        help='URLs to fetch and convert'
+    )
+
+    # Cleaning options
+    parser.add_argument(
+        '--no-clean',
+        action='store_true',
+        help='Disable HTML cleaning (removes nav, footer, ads, etc.)'
+    )
+
+    parser.add_argument(
+        '--no-prune',
+        action='store_true',
+        help='Disable content pruning (scores and removes low-quality nodes)'
+    )
+
+    # Threshold options
+    parser.add_argument(
+        '--pruning-threshold',
+        type=float,
+        default=0.48,
+        metavar='FLOAT',
+        help='Pruning score threshold (0.0-1.0). Lower keeps more content. Default: 0.48'
+    )
+
+    parser.add_argument(
+        '--min-words',
+        type=int,
+        default=50,
+        metavar='INT',
+        help='Minimum words per markdown block. Default: 50'
+    )
+
+    parser.add_argument(
+        '--min-word-threshold',
+        type=int,
+        default=10,
+        metavar='INT',
+        help='Minimum words for pruning filter. Default: 10'
+    )
+
+    # Advanced options
+    parser.add_argument(
+        '--no-dynamic-threshold',
+        action='store_true',
+        help='Disable dynamic threshold adjustment in pruning'
+    )
+
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    urls = sys.argv[1:]
+    args = parse_args()
 
-    if not urls:
-        print("Usage: python fetch_markdown.py <url1> <url2> ...", file=sys.stderr)
-        print("\nExample:", file=sys.stderr)
-        print('  python fetch_markdown.py "https://example.com/article"', file=sys.stderr)
-        sys.exit(1)
+    # Configure extraction settings from CLI args
+    EXTRACTION_CONFIG.enable_cleaning = not args.no_clean
+    EXTRACTION_CONFIG.enable_pruning = not args.no_prune
+    EXTRACTION_CONFIG.pruning_threshold = args.pruning_threshold
+    EXTRACTION_CONFIG.min_words = args.min_words
+    EXTRACTION_CONFIG.min_word_threshold = args.min_word_threshold
+    EXTRACTION_CONFIG.dynamic_threshold = not args.no_dynamic_threshold
 
-    asyncio.run(main(urls))
+    # Print config summary
+    print("Extraction config:", file=sys.stderr)
+    print(f"  Cleaning: {'enabled' if EXTRACTION_CONFIG.enable_cleaning else 'disabled'}", file=sys.stderr)
+    print(f"  Pruning: {'enabled' if EXTRACTION_CONFIG.enable_pruning else 'disabled'}", file=sys.stderr)
+    if EXTRACTION_CONFIG.enable_pruning:
+        print(f"  Pruning threshold: {EXTRACTION_CONFIG.pruning_threshold}", file=sys.stderr)
+    print(f"  Min words per block: {EXTRACTION_CONFIG.min_words}", file=sys.stderr)
+    print(file=sys.stderr)
+
+    asyncio.run(main(args.urls))
