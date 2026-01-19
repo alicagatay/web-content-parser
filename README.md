@@ -224,14 +224,14 @@ web-content-parser/
 python fetch_markdown.py [OPTIONS] urls...
 ```
 
-| Option                      | Description                                   | Default |
-| --------------------------- | --------------------------------------------- | ------- |
-| `--no-clean`                | Disable BeautifulSoup HTML cleaning           | Enabled |
-| `--no-prune`                | Disable content scoring/pruning               | Enabled |
-| `--pruning-threshold FLOAT` | Score threshold for keeping content (0.0-1.0) | 0.48    |
-| `--min-words INT`           | Minimum words per markdown block              | 50      |
-| `--min-word-threshold INT`  | Minimum words for pruning filter              | 10      |
-| `--no-dynamic-threshold`    | Disable dynamic threshold adjustment          | Enabled |
+| Option                      | Description                                   | Default      |
+| --------------------------- | --------------------------------------------- | ------------ |
+| `--no-clean`                | Disable BeautifulSoup HTML cleaning           | Enabled      |
+| `--no-prune`                | Disable content scoring/pruning               | Enabled      |
+| `--pruning-threshold FLOAT` | Score threshold for keeping content (0.0-1.0) | 0.48         |
+| `--min-words INT`           | Minimum words per markdown block              | 0 (disabled) |
+| `--min-word-threshold INT`  | Minimum words for pruning filter              | 10           |
+| `--no-dynamic-threshold`    | Disable dynamic threshold adjustment          | Enabled      |
 
 ### Examples
 
@@ -245,8 +245,8 @@ python fetch_markdown.py --no-clean "https://example.com/article"
 # More aggressive pruning (keeps less content)
 python fetch_markdown.py --pruning-threshold 0.6 "https://example.com/article"
 
-# Keep shorter paragraphs
-python fetch_markdown.py --min-words 20 "https://example.com/article"
+# Enable short paragraph filtering (remove blocks < 30 words)
+python fetch_markdown.py --min-words 30 "https://example.com/article"
 
 # Multiple URLs
 python fetch_markdown.py url1 url2 url3
