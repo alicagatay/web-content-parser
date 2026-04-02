@@ -17,10 +17,16 @@ SCOPES = [
 CREDENTIALS_FILE = Path(__file__).parent / 'credentials.json'
 TOKEN_FILE = Path(__file__).parent / 'token.json'
 
+# Cached credentials (loaded/refreshed once, reused for all service builds)
+_cached_credentials = None
+
 
 def get_credentials():
     """
-    Load or create OAuth credentials with automatic refresh
+    Load or create OAuth credentials with automatic refresh.
+    Credentials are cached after the first successful load so that
+    concurrent service builds reuse the same token without re-reading
+    disk or re-running the OAuth flow.
 
     Returns:
         google.oauth2.credentials.Credentials: Authenticated credentials
@@ -29,6 +35,11 @@ def get_credentials():
         FileNotFoundError: If credentials.json is not found
         ValueError: If the credentials file is invalid
     """
+    global _cached_credentials
+
+    if _cached_credentials and _cached_credentials.valid:
+        return _cached_credentials
+
     if not CREDENTIALS_FILE.exists():
         raise FileNotFoundError(
             f"OAuth credentials file not found: {CREDENTIALS_FILE}\n"
@@ -71,6 +82,7 @@ def get_credentials():
         # Save credentials for future use
         TOKEN_FILE.write_text(creds.to_json(), encoding='utf-8')
 
+    _cached_credentials = creds
     return creds
 
 
@@ -96,12 +108,13 @@ def get_drive_service():
     return build('drive', 'v3', credentials=credentials)
 
 
-def find_folder_id(folder_name='Resources'):
+def find_folder_id(folder_name='Resources', drive_service=None):
     """
     Find the Google Drive folder ID by name
 
     Args:
         folder_name: Name of the folder to find (default: 'Resources')
+        drive_service: Optional pre-built Drive service (avoids recreating)
 
     Returns:
         str: The folder ID
@@ -110,7 +123,8 @@ def find_folder_id(folder_name='Resources'):
         RuntimeError: If folder is not found or not accessible
     """
     try:
-        drive_service = get_drive_service()
+        if drive_service is None:
+            drive_service = get_drive_service()
 
         # Search in user's Drive (no need for 'corpora' with OAuth - you own the files)
         query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
