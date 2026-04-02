@@ -32,7 +32,7 @@ DEFAULT_NOISE_SELECTORS = [
 
     # Social and sharing
     '.social-share', '.share-buttons', '.social-links', '.social-icons',
-    '.sharing', '.share', '[class*="share"]',
+    '.sharing', '.share',
 
     # Comments
     '.comments', '.comment-section', '#comments', '#disqus_thread',
