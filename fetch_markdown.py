@@ -3,773 +3,47 @@ Web Content Parser - Fetch markdown versions of web pages and create Google Docs
 """
 import asyncio
 import argparse
-import re
 import sys
-from dataclasses import dataclass
 from datetime import datetime
-from collections import deque
-from pathlib import Path
 from urllib.parse import urlparse
+
 import aiohttp
 from tqdm.asyncio import tqdm
-from playwright.async_api import async_playwright, Browser, TimeoutError as PlaywrightTimeoutError
-from lxml import html as lxml_html, etree
-import html2text
-from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, BrowserContext
 
 try:
     import trafilatura
 except Exception:  # pragma: no cover
     trafilatura = None
 
-# Import cleaning and filtering modules
-from content_filter import FilterConfig, PruningContentFilter
-from html_cleaner import (
-    clean_html_for_extraction,
-    extract_main_content,
-    filter_short_blocks,
-)
-
-
-@dataclass
-class ExtractionConfig:
-    """Configuration for content extraction."""
-    # Enable HTML cleaning before extraction
-    enable_cleaning: bool = True
-
-    # Enable content pruning/scoring
-    enable_pruning: bool = True
-
-    # Pruning threshold (0.0-1.0). Lower keeps more, higher is more aggressive
-    pruning_threshold: float = 0.48
-
-    # Minimum word count for blocks (in final markdown filtering)
-    min_words: int = 0
-
-    # Minimum word count for pruning filter
-    min_word_threshold: int = 10
-
-    # Use dynamic threshold adjustment
-    dynamic_threshold: bool = True
-
-# Import Google API modules
+from html_cleaner import filter_short_blocks
 from auth import get_docs_service, get_drive_service, find_folder_id
-from docs_converter import convert_markdown_to_doc_requests
+from google_drive import (
+    sanitize_doc_title,
+    _build_doc_title_cache_sync,
+    create_google_doc,
+)
+from title_extractor import (
+    extract_title_from_metadata,
+    extract_h1_title,
+    fallback_name_from_url,
+)
+from extraction import (
+    ExtractionConfig,
+    fetch_html,
+    extract_with_multi_div,
+    extract_with_css_selectors,
+    apply_extraction_pipeline,
+)
+from playwright_fetch import fetch_with_playwright
 
 TIMEOUT_SECS = 30
 DRIVE_FOLDER_NAME = "Resources"  # Google Drive folder name for created docs
 MAX_CONCURRENCY = 15
-FETCH_RETRIES = 2
-FETCH_RETRY_BASE_DELAY_SECS = 1.0
 MAX_RETRY_ROUNDS = 3
 
 # Playwright settings
 PLAYWRIGHT_CONCURRENCY = 15
-PLAYWRIGHT_TIMEOUT = 45000  # 45 seconds (in milliseconds)
-PLAYWRIGHT_RETRIES = 3      # Playwright fetch retries
-
-# Global extraction config (set by CLI args)
-EXTRACTION_CONFIG: ExtractionConfig = ExtractionConfig()
-
-
-def sanitize_doc_title(name: str) -> str:
-    """
-    Sanitize a string to be a valid Google Docs title.
-    Similar to sanitize_filename but for document titles.
-    """
-    name = name.strip()
-    # Normalize whitespace
-    name = re.sub(r"\s+", " ", name)
-    # Remove problematic characters
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", name)
-    # Limit length
-    name = name[:200]
-    return name or "Untitled"
-
-
-def _find_existing_doc_id_recursive_sync(
-    drive_service,
-    root_folder_id: str,
-    title: str
-) -> str | None:
-    """
-    Synchronous helper: Recursively search for a document by title in a folder
-    and all nested subfolders.
-
-    Args:
-        drive_service: Authenticated Google Drive service
-        root_folder_id: ID of the root folder to search in
-        title: Document title to find
-
-    Returns:
-        str | None: Document ID if found, otherwise None
-    """
-    escaped_title = title.replace("'", "\\'")
-    doc_query_template = (
-        "name='{title}' and '{folder_id}' in parents and "
-        "mimeType='application/vnd.google-apps.document' and trashed=false"
-    )
-    folder_query_template = (
-        "'{folder_id}' in parents and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-
-    queue = deque([root_folder_id])
-    visited = set()
-
-    while queue:
-        folder_id = queue.popleft()
-        if folder_id in visited:
-            continue
-        visited.add(folder_id)
-
-        # Check for a matching document in this folder
-        doc_query = doc_query_template.format(title=escaped_title, folder_id=folder_id)
-        doc_results = drive_service.files().list(
-            q=doc_query,
-            spaces='drive',
-            fields='files(id, name)',
-            pageSize=1
-        ).execute()
-
-        doc_files = doc_results.get('files', [])
-        if doc_files:
-            return doc_files[0].get('id')
-
-        # Queue subfolders
-        page_token = None
-        while True:
-            folder_query = folder_query_template.format(folder_id=folder_id)
-            folder_results = drive_service.files().list(
-                q=folder_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name)',
-                pageSize=1000,
-                pageToken=page_token
-            ).execute()
-
-            for folder in folder_results.get('files', []):
-                folder_id_child = folder.get('id')
-                if folder_id_child:
-                    queue.append(folder_id_child)
-
-            page_token = folder_results.get('nextPageToken')
-            if not page_token:
-                break
-
-    return None
-
-
-def _build_doc_title_cache_sync(
-    drive_service,
-    root_folder_id: str
-) -> dict[str, tuple[str, bool]]:
-    """
-    Synchronous helper: Build a cache of document titles to IDs by
-    recursively traversing the root folder and all subfolders.
-
-    Args:
-        drive_service: Authenticated Google Drive service
-        root_folder_id: ID of the root folder to search in
-
-    Returns:
-        dict[str, tuple[str, bool]]: Mapping of document title -> (document ID, created_this_run)
-    """
-    doc_cache: dict[str, tuple[str, bool]] = {}
-    folder_query_template = (
-        "'{folder_id}' in parents and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    doc_query_template = (
-        "'{folder_id}' in parents and "
-        "mimeType='application/vnd.google-apps.document' and trashed=false"
-    )
-
-    queue = deque([root_folder_id])
-    visited = set()
-
-    while queue:
-        folder_id = queue.popleft()
-        if folder_id in visited:
-            continue
-        visited.add(folder_id)
-
-        # List documents in this folder
-        page_token = None
-        while True:
-            doc_query = doc_query_template.format(folder_id=folder_id)
-            doc_results = drive_service.files().list(
-                q=doc_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name)',
-                pageSize=1000,
-                pageToken=page_token
-            ).execute()
-
-            for doc in doc_results.get('files', []):
-                doc_id = doc.get('id')
-                doc_name = doc.get('name')
-                if doc_id and doc_name and doc_name not in doc_cache:
-                    doc_cache[doc_name] = (doc_id, False)
-
-            page_token = doc_results.get('nextPageToken')
-            if not page_token:
-                break
-
-        # Queue subfolders
-        page_token = None
-        while True:
-            folder_query = folder_query_template.format(folder_id=folder_id)
-            folder_results = drive_service.files().list(
-                q=folder_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name)',
-                pageSize=1000,
-                pageToken=page_token
-            ).execute()
-
-            for folder in folder_results.get('files', []):
-                folder_id_child = folder.get('id')
-                if folder_id_child:
-                    queue.append(folder_id_child)
-
-            page_token = folder_results.get('nextPageToken')
-            if not page_token:
-                break
-
-    return doc_cache
-
-
-async def create_google_doc(
-    markdown_content: str,
-    title: str,
-    folder_id: str,
-    doc_cache: dict[str, tuple[str, bool]] | None = None,
-    cache_lock: asyncio.Lock | None = None
-) -> str:
-    """
-    Create a Google Doc from markdown content
-
-    Args:
-        markdown_content: Raw markdown text
-        title: Document title
-        folder_id: Google Drive folder ID
-
-    Returns:
-        str: URL of the created document
-    """
-    try:
-        docs_service = get_docs_service()
-        drive_service = get_drive_service()
-
-        existing_doc_id = None
-        created_this_run = False
-        if doc_cache is not None:
-            if cache_lock:
-                async with cache_lock:
-                    cached = doc_cache.get(title)
-            else:
-                cached = doc_cache.get(title)
-            if cached:
-                existing_doc_id, created_this_run = cached
-        else:
-            # Fallback: recursive search for existing doc by title
-            existing_doc_id = await asyncio.to_thread(
-                _find_existing_doc_id_recursive_sync, drive_service, folder_id, title
-            )
-
-        if existing_doc_id and not created_this_run:
-            # Document already exists from a previous run, return its URL
-            print(f"↺ Existing doc found for '{title}', reusing.", file=sys.stderr)
-            return f"https://docs.google.com/document/d/{existing_doc_id}/edit"
-
-        if existing_doc_id and created_this_run:
-            # Reuse the doc created in this run (likely from a previous failed attempt)
-            doc_id = existing_doc_id
-        else:
-            # Create a blank Google Doc without parent (avoids quota issues)
-            file_metadata = {
-                'name': title,
-                'mimeType': 'application/vnd.google-apps.document'
-            }
-
-            doc = await asyncio.to_thread(
-                lambda: drive_service.files().create(body=file_metadata, fields='id').execute()
-            )
-            doc_id = doc['id']
-
-        # Update cache immediately to prevent duplicate docs on retries
-        if doc_cache is not None:
-            if cache_lock:
-                async with cache_lock:
-                    doc_cache[title] = (doc_id, True)
-            else:
-                doc_cache[title] = (doc_id, True)
-
-        if not (existing_doc_id and created_this_run):
-            # Move it to the target folder and transfer ownership to you
-            await asyncio.to_thread(
-                lambda: drive_service.files().update(
-                    fileId=doc_id,
-                    addParents=folder_id,
-                    removeParents='root',
-                    fields='id, parents'
-                ).execute()
-            )
-
-        # Convert markdown to Docs API requests
-        requests = convert_markdown_to_doc_requests(markdown_content, doc_title=title)
-
-        # Apply all formatting in a single batchUpdate
-        if requests:
-            await asyncio.to_thread(
-                lambda: docs_service.documents().batchUpdate(
-                    documentId=doc_id,
-                    body={'requests': requests}
-                ).execute()
-            )
-
-        # Update cache with the newly created doc
-        if doc_cache is not None:
-            if cache_lock:
-                async with cache_lock:
-                    doc_cache[title] = (doc_id, False)
-            else:
-                doc_cache[title] = (doc_id, False)
-
-        # Return shareable URL
-        return f"https://docs.google.com/document/d/{doc_id}/edit"
-
-    except Exception as e:
-        raise RuntimeError(f"Failed to create Google Doc: {e}")
-
-
-def extract_title_from_metadata(html: str, url: str) -> str | None:
-    """
-    Extract title from page metadata using trafilatura.
-
-    Returns:
-        The title from metadata, or None if not found
-    """
-    if trafilatura is None:
-        return None
-
-    try:
-        metadata = trafilatura.extract_metadata(html, default_url=url)
-        if metadata and metadata.title:
-            return metadata.title.strip()
-    except Exception:
-        pass
-    return None
-
-
-def extract_title_from_metadata(html: str, url: str) -> str | None:
-    """
-    Extract title from page metadata using trafilatura.
-
-    Returns:
-        The title from metadata, or None if not found
-    """
-    if trafilatura is None:
-        return None
-
-    try:
-        metadata = trafilatura.extract_metadata(html, default_url=url)
-        if metadata and metadata.title:
-            return metadata.title.strip()
-    except Exception:
-        pass
-    return None
-
-
-def extract_h1_title(markdown: str) -> str | None:
-    """
-    Extract the first H1 heading from markdown content.
-
-    Returns:
-        The title text without the # prefix, or None if no H1 found
-    """
-    for line in markdown.splitlines():
-        match = re.match(r"^\s*#\s+(.+?)\s*$", line)
-        if match:
-            return match.group(1)
-    return None
-
-
-def fallback_name_from_url(original_url: str) -> str:
-    """
-    Generate a filename from the URL structure when no title is found.
-    """
-    # Ensure URL has a scheme for parsing
-    if "://" not in original_url:
-        original_url = "https://" + original_url
-
-    parsed = urlparse(original_url)
-    base = (parsed.netloc + parsed.path).strip("/").replace("/", " - ")
-    base = re.sub(r"[^A-Za-z0-9._ -]+", "", base).strip()
-    return base or "page"
-
-
-def unique_path(path: Path) -> Path:
-    """
-    Generate a unique file path by appending (2), (3), etc. if needed.
-    """
-    if not path.exists():
-        return path
-
-    stem, suffix = path.stem, path.suffix
-    for i in range(2, 10_000):
-        candidate = path.with_name(f"{stem} ({i}){suffix}")
-        if not candidate.exists():
-            return candidate
-
-    raise RuntimeError(f"Could not find unique filename for {path}")
-
-
-async def fetch_markdown(
-    session: aiohttp.ClientSession,
-    url: str
-) -> tuple[str, str]:
-    """
-    Fetch HTML and extract markdown content using trafilatura.
-
-    Returns:
-        tuple[html, markdown]: Raw HTML and extracted markdown
-    """
-    if trafilatura is None:
-        raise RuntimeError(
-            "trafilatura is not installed. Install it with: pip install trafilatura"
-        )
-
-    # Ensure URL has scheme
-    url = url.strip()
-    if "://" not in url:
-        url = "https://" + url
-
-    last_error: Exception | None = None
-
-    for attempt in range(FETCH_RETRIES + 1):
-        try:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-
-            # Extract markdown using trafilatura
-            md = trafilatura.extract(
-                html,
-                include_comments=False,
-                include_tables=True,
-                include_links=True,
-                favor_recall=True,
-                output_format="markdown",
-                url=url,
-            )
-
-            if not md or not md.strip():
-                raise RuntimeError("Content extraction produced empty result")
-
-            return (html, md)
-
-        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
-            last_error = e
-            if attempt >= FETCH_RETRIES:
-                break
-
-            await asyncio.sleep(FETCH_RETRY_BASE_DELAY_SECS * (2 ** attempt))
-
-    raise RuntimeError(f"Failed to extract content from {url}: {last_error}")
-
-
-def extract_with_multi_div(html: str) -> str | None:
-    """
-    Extract content by finding and combining multiple content divs.
-    This handles sites like Ars Technica that split articles across multiple divs.
-
-    Args:
-        html: Raw HTML content
-
-    Returns:
-        Markdown string or None if extraction fails
-    """
-    try:
-        tree = lxml_html.fromstring(html)
-
-        # Common content container patterns
-        patterns = [
-            '//div[contains(@class, "post-content")]',
-            '//div[contains(@class, "article-content")]',
-            '//div[contains(@class, "article-body")]',
-            '//div[contains(@class, "entry-content")]',
-            '//article//p/..',  # Parent of paragraphs within article tags
-        ]
-
-        best_result = None
-        best_length = 0
-
-        for pattern in patterns:
-            try:
-                content_divs = tree.xpath(pattern)
-
-                if len(content_divs) > 1:  # Only worth it if multiple divs found
-                    # Combine all matching divs
-                    all_parts = []
-                    for div in content_divs:
-                        html_part = etree.tostring(div, encoding='unicode')
-                        all_parts.append(html_part)
-
-                    combined = "\n".join(all_parts)
-
-                    # Convert to markdown
-                    h = html2text.HTML2Text()
-                    h.ignore_links = False
-                    h.body_width = 0
-                    md = h.handle(combined)
-
-                    if md and len(md.strip()) > best_length:
-                        best_result = md.strip()
-                        best_length = len(best_result)
-
-            except Exception:
-                continue
-
-        return best_result
-
-    except Exception:
-        return None
-
-
-def extract_with_css_selectors(html: str, url: str | None = None) -> str | None:
-    """
-    Extract content using priority-ordered CSS selectors.
-
-    Uses common content patterns to find main content.
-
-    Args:
-        html: HTML content
-        url: Optional URL (for future use)
-
-    Returns:
-        Markdown string or None if extraction fails
-    """
-    try:
-        # Try to extract main content
-        main_content = extract_main_content(html, url)
-
-        if main_content:
-            # Convert to markdown
-            h = html2text.HTML2Text()
-            h.ignore_links = False
-            h.body_width = 0
-            md = h.handle(main_content)
-
-            if md and len(md.strip()) > 200:
-                return md.strip()
-
-        # Fallback: try common selectors manually
-        soup = BeautifulSoup(html, 'lxml')
-
-        selectors = [
-            'article.post-content',
-            'article.entry-content',
-            'article',
-            'main article',
-            '[role="main"]',
-            'main',
-            '.article-content',
-            '.post-content',
-            '.entry-content',
-            '.content-body',
-        ]
-
-        for selector in selectors:
-            try:
-                element = soup.select_one(selector)
-                if element:
-                    text = element.get_text(strip=True)
-                    if len(text) > 500:  # Minimum threshold
-                        h = html2text.HTML2Text()
-                        h.ignore_links = False
-                        h.body_width = 0
-                        md = h.handle(str(element))
-                        if md:
-                            return md.strip()
-            except Exception:
-                continue
-
-        return None
-
-    except Exception:
-        return None
-
-
-def apply_extraction_pipeline(html: str, url: str) -> tuple[str, str]:
-    """
-    Apply the full extraction pipeline: clean, prune, extract.
-
-    Returns both cleaned HTML and the HTML after pruning.
-
-    Args:
-        html: Raw HTML
-        url: Page URL
-
-    Returns:
-        Tuple of (cleaned_html, pruned_html)
-    """
-    config = EXTRACTION_CONFIG
-
-    # Step 1: Basic cleaning (remove scripts, noise elements, etc.)
-    if config.enable_cleaning:
-        cleaned_html = clean_html_for_extraction(html, url=url)
-    else:
-        cleaned_html = html
-
-    # Step 2: Content-aware pruning
-    if config.enable_pruning:
-        filter_config = FilterConfig(
-            pruning_threshold=config.pruning_threshold,
-            min_word_threshold=config.min_word_threshold,
-            dynamic_threshold=config.dynamic_threshold,
-        )
-        pruning_filter = PruningContentFilter(filter_config)
-        pruned_html = pruning_filter.filter_content(cleaned_html)
-    else:
-        pruned_html = cleaned_html
-
-    return cleaned_html, pruned_html
-
-
-async def smart_wait_for_content(page) -> None:
-    """
-    Smart waiting for dynamic content with multiple strategies.
-    """
-    # Common selectors for article content
-    content_selectors = [
-        'article',
-        'main',
-        '[role="main"]',
-        '.article-content',
-        '.post-content',
-        '.entry-content',
-        '[itemprop="articleBody"]',
-    ]
-
-    # Try each selector with short timeout
-    for selector in content_selectors:
-        try:
-            await page.wait_for_selector(selector, timeout=2000)
-            return  # Found content, done waiting
-        except Exception:
-            continue
-
-    # Fallback: wait for network to settle
-    try:
-        await page.wait_for_load_state('networkidle', timeout=5000)
-    except Exception:
-        pass
-
-    # Scroll to trigger lazy loading
-    try:
-        await page.evaluate("""
-            () => {
-                // Scroll to middle
-                window.scrollTo(0, document.body.scrollHeight / 2);
-            }
-        """)
-        await asyncio.sleep(0.5)
-
-        await page.evaluate("""
-            () => {
-                // Scroll to bottom
-                window.scrollTo(0, document.body.scrollHeight);
-            }
-        """)
-        await asyncio.sleep(0.5)
-
-        # Scroll back to top
-        await page.evaluate("() => window.scrollTo(0, 0)")
-    except Exception:
-        pass
-
-
-async def fetch_with_playwright(
-    browser: Browser,
-    url: str
-) -> str:
-    """
-    Fetch page content using Playwright (headless browser).
-    This handles JavaScript-rendered content.
-
-    Args:
-        browser: Playwright browser instance
-        url: Target URL
-
-    Returns:
-        str: Rendered HTML after JavaScript execution
-    """
-    last_error: Exception | None = None
-
-    for attempt in range(PLAYWRIGHT_RETRIES + 1):
-        context = None
-        try:
-            # Create new browser context with anti-detection settings
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={'width': 1920, 'height': 1080},
-                # Additional stealth settings
-                locale='en-US',
-                timezone_id='America/New_York',
-                permissions=['geolocation'],
-                java_script_enabled=True,
-                bypass_csp=False,  # Don't bypass to seem more like real browser
-            )
-
-            # Add extra headers to look more like a real browser
-            await context.set_extra_http_headers({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Upgrade-Insecure-Requests': '1',
-            })
-
-            page = await context.new_page()
-
-            # Hide webdriver property
-            await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-            """)
-
-            # Navigate and wait for network to be mostly idle
-            await page.goto(url, timeout=PLAYWRIGHT_TIMEOUT, wait_until="domcontentloaded")
-
-            # Use smart waiting for dynamic content
-            await smart_wait_for_content(page)
-
-            # Get fully rendered HTML
-            html = await page.content()
-
-            # Cleanup
-            await context.close()
-
-            return html
-
-        except (PlaywrightTimeoutError, Exception) as e:
-            last_error = e
-            if context:
-                try:
-                    await context.close()
-                except:
-                    pass
-            if attempt >= PLAYWRIGHT_RETRIES:
-                break
-            await asyncio.sleep(2 * (attempt + 1))
-
-    raise RuntimeError(f"Playwright fetch failed after {PLAYWRIGHT_RETRIES + 1} attempts: {last_error}")
 
 
 async def process_url(
@@ -777,15 +51,14 @@ async def process_url(
     original_url: str,
     folder_id: str,
     semaphore: asyncio.Semaphore,
-    browser: Browser | None,
+    pw_context: BrowserContext | None,
     playwright_sem: asyncio.Semaphore | None,
     doc_cache: dict[str, tuple[str, bool]] | None,
-    cache_lock: asyncio.Lock | None
+    cache_lock: asyncio.Lock | None,
+    config: ExtractionConfig,
 ) -> tuple[str, str, str, bool, str, int]:
     """
     Process a single URL: fetch HTML, extract markdown, create Google Doc.
-    Uses adaptive extraction: first try without site rules, if quality is low,
-    retry with site rules and learn new rules if they help.
 
     Returns:
         (original_url, doc_url, doc_title, used_title, extraction_method, content_length)
@@ -794,7 +67,6 @@ async def process_url(
     md = None
     extraction_method = ""
     content_length = 0
-    config = EXTRACTION_CONFIG
 
     def run_extractions_on_html(
         source_name: str,
@@ -809,7 +81,7 @@ async def process_url(
 
         # Apply cleaning pipeline
         if config.enable_cleaning or config.enable_pruning:
-            cleaned_html, pruned_html = apply_extraction_pipeline(raw_html, url)
+            cleaned_html, pruned_html = apply_extraction_pipeline(raw_html, url, config)
         else:
             cleaned_html = raw_html
             pruned_html = raw_html
@@ -904,45 +176,42 @@ async def process_url(
     aiohttp_html = None
     playwright_html = None
 
-    if browser and playwright_sem:
+    if pw_context and playwright_sem:
         # Launch both fetch methods in parallel
         async def fetch_aiohttp():
             try:
-                return await fetch_markdown(session, original_url)
+                return await fetch_html(session, original_url)
             except Exception as e:
-                return (None, None, e)
+                return e
 
         async def fetch_playwright_wrapper():
             try:
                 async with playwright_sem:
-                    return await fetch_with_playwright(browser, original_url)
+                    return await fetch_with_playwright(pw_context, original_url)
             except Exception as e:
-                return (None, e)
+                return e
 
         # Run both in parallel
-        aiohttp_result, playwright_html_result = await asyncio.gather(
+        aiohttp_result, playwright_result = await asyncio.gather(
             fetch_aiohttp(),
             fetch_playwright_wrapper()
         )
 
         # Extract HTML from results
-        if len(aiohttp_result) == 2:  # Success case
-            aiohttp_html, _ = aiohttp_result
+        if not isinstance(aiohttp_result, Exception):
+            aiohttp_html = aiohttp_result
 
-        if not isinstance(playwright_html_result, tuple):  # Success case (got HTML string)
-            playwright_html = playwright_html_result
+        if not isinstance(playwright_result, Exception):
+            playwright_html = playwright_result
 
         if not aiohttp_html and not playwright_html:
-            # Both methods failed
-            if len(aiohttp_result) == 3:  # aiohttp exception
-                raise aiohttp_result[2]
-            elif isinstance(playwright_html_result, tuple):  # Playwright exception
-                raise playwright_html_result[1]
-            else:
-                raise RuntimeError("Both aiohttp and Playwright failed to extract content")
+            # Both methods failed -- raise the first available error
+            aiohttp_error = aiohttp_result if isinstance(aiohttp_result, Exception) else None
+            playwright_error = playwright_result if isinstance(playwright_result, Exception) else None
+            raise aiohttp_error or playwright_error or RuntimeError("Both aiohttp and Playwright failed to extract content")
     else:
         # Playwright not available, use aiohttp only
-        aiohttp_html, _ = await fetch_markdown(session, original_url)
+        aiohttp_html = await fetch_html(session, original_url)
 
     # Run extraction on all available HTML sources
     all_results = []
@@ -1004,32 +273,42 @@ async def process_url_safe(
     original_url: str,
     folder_id: str,
     semaphore: asyncio.Semaphore,
-    browser: Browser | None,
+    pw_context: BrowserContext | None,
     playwright_sem: asyncio.Semaphore | None,
     doc_cache: dict[str, tuple[str, bool]] | None,
-    cache_lock: asyncio.Lock | None
+    cache_lock: asyncio.Lock | None,
+    config: ExtractionConfig,
 ) -> tuple[str, tuple[str, str, str, bool, str, int] | Exception]:
     try:
         async with semaphore:
             return (original_url, await process_url(
                 session, original_url, folder_id, semaphore,
-                browser, playwright_sem, doc_cache, cache_lock
+                pw_context, playwright_sem,
+                doc_cache, cache_lock, config
             ))
     except Exception as e:
         return (original_url, e)
 
 
-async def main(urls: list[str]) -> None:
+async def main(urls: list[str], config: ExtractionConfig) -> None:
     """
     Main async entry point: process all URLs concurrently with automatic retry.
 
     Args:
         urls: List of URLs to process
+        config: Extraction configuration
     """
+    # Warm up credentials cache (authenticates once, reused by all service builds)
+    try:
+        drive_service = get_drive_service()
+    except Exception as e:
+        print(f"\n❌ Error creating Google API services: {e}", file=sys.stderr)
+        sys.exit(1)
+
     try:
         # Find the Resources folder
         print("Locating Google Drive folder...", file=sys.stderr)
-        folder_id = find_folder_id(DRIVE_FOLDER_NAME)
+        folder_id = find_folder_id(DRIVE_FOLDER_NAME, drive_service=drive_service)
         print(f"✓ Found '{DRIVE_FOLDER_NAME}' folder\n", file=sys.stderr)
     except Exception as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
@@ -1049,7 +328,6 @@ async def main(urls: list[str]) -> None:
 
     # Build a doc title cache once per run to avoid repeated recursive searches
     try:
-        drive_service = get_drive_service()
         doc_cache = await asyncio.to_thread(
             _build_doc_title_cache_sync, drive_service, folder_id
         )
@@ -1060,9 +338,32 @@ async def main(urls: list[str]) -> None:
         doc_cache = None
         cache_lock = None
 
-    # Launch Playwright browser
+    # Launch Playwright browser with shared context
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
+        pw_context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
+            timezone_id='America/New_York',
+            permissions=['geolocation'],
+            java_script_enabled=True,
+        )
+        await pw_context.set_extra_http_headers({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+        })
+        await pw_context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
         playwright_sem = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
 
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -1078,7 +379,8 @@ async def main(urls: list[str]) -> None:
                 tasks = [
                     asyncio.create_task(process_url_safe(
                         session, u, folder_id, semaphore,
-                        browser, playwright_sem, doc_cache, cache_lock
+                        pw_context, playwright_sem,
+                        doc_cache, cache_lock, config
                     ))
                     for u in urls_to_process
                 ]
@@ -1109,7 +411,8 @@ async def main(urls: list[str]) -> None:
                 if urls_to_process and retry_round < MAX_RETRY_ROUNDS:
                     await asyncio.sleep(2)
 
-        # Close browser
+        # Close context and browser
+        await pw_context.close()
         await browser.close()
 
     # Report final results
@@ -1144,20 +447,22 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python fetch_markdown.py "https://example.com/article"
-  python fetch_markdown.py --no-clean "https://example.com/article"
-  python fetch_markdown.py --pruning-threshold 0.6 --min-words 30 url1 url2
+  web-content-parser                          # interactive mode
+  web-content-parser "https://example.com/article"
+  web-content-parser --no-clean "https://example.com/article"
+  web-content-parser --pruning-threshold 0.6 --min-words 30 url1 url2
 
 Configuration:
   The extraction pipeline cleans HTML and prunes low-quality content by default.
   Use --no-clean and --no-prune to disable these features for faster processing.
+  Run without URLs to enter interactive mode (enter URLs one at a time).
         """
     )
 
     parser.add_argument(
         'urls',
-        nargs='+',
-        help='URLs to fetch and convert'
+        nargs='*',
+        help='URLs to fetch and convert (omit to use interactive mode)'
     )
 
     # Cleaning options
@@ -1208,24 +513,102 @@ Configuration:
     return parser.parse_args()
 
 
+def _validate_url(url: str) -> tuple[bool, str]:
+    """Minimal URL validation. Auto-prepends https:// if no scheme."""
+    url = url.strip()
+    if not url:
+        return False, url
+    if "://" not in url:
+        url = "https://" + url
+    parsed = urlparse(url)
+    if not parsed.netloc or "." not in parsed.netloc:
+        return False, url
+    return True, url
+
+
+def interactive_prompt() -> list[str]:
+    """Interactive URL entry mode. Returns list of URLs."""
+    print("\n" + "=" * 44, file=sys.stderr)
+    print("  Web Content Parser - Interactive Mode", file=sys.stderr)
+    print("=" * 44, file=sys.stderr)
+    print("\nEnter URLs one at a time, then type \"ready\" to start.", file=sys.stderr)
+    print("Press Ctrl+C twice to exit.\n", file=sys.stderr)
+
+    import time
+
+    urls = []
+    last_ctrl_c = 0.0
+    while True:
+        try:
+            raw = input(f"[{len(urls) + 1}] Enter a URL (or \"ready\" to start): ")
+            raw = raw.strip()
+
+            if not raw:
+                continue
+
+            if raw.lower() == "ready":
+                break
+
+            valid, normalized = _validate_url(raw)
+            if not valid:
+                print(f"  Invalid URL: \"{raw}\". Please enter a valid URL.", file=sys.stderr)
+                continue
+
+            urls.append(normalized)
+            print(f"  Added: {normalized}", file=sys.stderr)
+
+        except KeyboardInterrupt:
+            now = time.monotonic()
+            if now - last_ctrl_c < 1.0:
+                print("\nExiting.", file=sys.stderr)
+                sys.exit(0)
+            last_ctrl_c = now
+            print("\nPress Ctrl+C again to exit.", file=sys.stderr)
+        except EOFError:
+            print("\nExiting.", file=sys.stderr)
+            sys.exit(0)
+
+    if not urls:
+        print("No URLs entered. Exiting.", file=sys.stderr)
+        sys.exit(0)
+
+    print(f"\nURLs to process ({len(urls)}):", file=sys.stderr)
+    for i, url in enumerate(urls, 1):
+        print(f"  {i}. {url}", file=sys.stderr)
+    print(file=sys.stderr)
+
+    return urls
+
+
 if __name__ == "__main__":
     args = parse_args()
 
+    # Determine URLs: from args or interactive mode
+    if args.urls:
+        urls = args.urls
+    elif sys.stdin.isatty():
+        urls = interactive_prompt()
+    else:
+        print("Error: No URLs provided. In non-interactive mode, pass URLs as arguments.", file=sys.stderr)
+        sys.exit(1)
+
     # Configure extraction settings from CLI args
-    EXTRACTION_CONFIG.enable_cleaning = not args.no_clean
-    EXTRACTION_CONFIG.enable_pruning = not args.no_prune
-    EXTRACTION_CONFIG.pruning_threshold = args.pruning_threshold
-    EXTRACTION_CONFIG.min_words = args.min_words
-    EXTRACTION_CONFIG.min_word_threshold = args.min_word_threshold
-    EXTRACTION_CONFIG.dynamic_threshold = not args.no_dynamic_threshold
+    extraction_config = ExtractionConfig(
+        enable_cleaning=not args.no_clean,
+        enable_pruning=not args.no_prune,
+        pruning_threshold=args.pruning_threshold,
+        min_words=args.min_words,
+        min_word_threshold=args.min_word_threshold,
+        dynamic_threshold=not args.no_dynamic_threshold,
+    )
 
     # Print config summary
     print("Extraction config:", file=sys.stderr)
-    print(f"  Cleaning: {'enabled' if EXTRACTION_CONFIG.enable_cleaning else 'disabled'}", file=sys.stderr)
-    print(f"  Pruning: {'enabled' if EXTRACTION_CONFIG.enable_pruning else 'disabled'}", file=sys.stderr)
-    if EXTRACTION_CONFIG.enable_pruning:
-        print(f"  Pruning threshold: {EXTRACTION_CONFIG.pruning_threshold}", file=sys.stderr)
-    print(f"  Min words per block: {EXTRACTION_CONFIG.min_words}", file=sys.stderr)
+    print(f"  Cleaning: {'enabled' if extraction_config.enable_cleaning else 'disabled'}", file=sys.stderr)
+    print(f"  Pruning: {'enabled' if extraction_config.enable_pruning else 'disabled'}", file=sys.stderr)
+    if extraction_config.enable_pruning:
+        print(f"  Pruning threshold: {extraction_config.pruning_threshold}", file=sys.stderr)
+    print(f"  Min words per block: {extraction_config.min_words}", file=sys.stderr)
     print(file=sys.stderr)
 
-    asyncio.run(main(args.urls))
+    asyncio.run(main(urls, extraction_config))
