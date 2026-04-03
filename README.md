@@ -30,13 +30,14 @@ A powerful Python CLI tool that fetches web content and automatically creates fo
 
 ### Reliability & UX
 
-- **Automatic retry** - failed URLs retry up to 3 rounds with exponential backoff
+- **Interactive CLI mode** - enter URLs one at a time without quotes, type "ready" to start
+- **Automatic retry** - failed URLs retry up to 3 batch-level rounds
 - **Automatic title extraction** - from metadata, H1 headings, or URL fallback
 - **Duplicate avoidance** - reuses existing Docs when a matching title already exists (recursive Drive search)
 - **Real-time progress bar** - shows completion status, speed, and extraction method used
 - **Detailed logging** - shows extraction method, content length, and document title for each URL
 - **Configurable CLI** - tune cleaning, pruning, and filtering via command-line flags
-- **OAuth authentication** - one-time browser login, then automatic for future runs
+- **OAuth authentication** - one-time browser login, then automatic with cached credentials
 - **Resilient error handling** - continues processing even if some URLs fail
 
 ## Prerequisites
@@ -102,15 +103,58 @@ By default, docs are created in a folder named **"Resources"** in your Google Dr
 
 ## Usage
 
-Pass one or more URLs as command-line arguments:
+### Interactive Mode (recommended)
+
+Run the command with no arguments to enter interactive mode:
 
 ```bash
-python fetch_markdown.py "https://example.com/article1" "https://example.com/article2"
+web-content-parser
+```
+
+The tool will prompt you to enter URLs one at a time (no quotes needed):
+
+```
+============================================
+  Web Content Parser - Interactive Mode
+============================================
+
+Enter URLs one at a time, then type "ready" to start.
+Press Ctrl+C twice to exit.
+
+[1] Enter a URL (or "ready" to start): https://example.com/article1
+  Added: https://example.com/article1
+[2] Enter a URL (or "ready" to start): https://example.com/article2
+  Added: https://example.com/article2
+[3] Enter a URL (or "ready" to start): ready
+
+URLs to process (2):
+  1. https://example.com/article1
+  2. https://example.com/article2
+```
+
+To exit without processing, press **Ctrl+C twice** within 1 second.
+
+### Direct Mode
+
+You can also pass URLs directly as command-line arguments:
+
+```bash
+web-content-parser "https://example.com/article1" "https://example.com/article2"
+```
+
+CLI flags work with both modes:
+
+```bash
+# Interactive mode with cleaning disabled
+web-content-parser --no-clean
+
+# Direct mode with options
+web-content-parser --pruning-threshold 0.6 --min-words 30 url1 url2
 ```
 
 **First run:** Browser will open for Google authorization (one-time only)
 
-**Subsequent runs:** Automatic authentication using saved token
+**Subsequent runs:** Automatic authentication using cached credentials
 
 ### What happens:
 
@@ -205,7 +249,11 @@ All Google Docs are created in your **Resources** folder with:
 
 ```
 web-content-parser/
-├── fetch_markdown.py      # Main CLI script with hybrid extraction
+├── fetch_markdown.py      # Main CLI entry point & orchestrator
+├── extraction.py          # ExtractionConfig, HTML fetching, extraction strategies
+├── playwright_fetch.py    # Playwright browser fetching & smart content waiting
+├── google_drive.py        # Google Doc creation, caching, folder management
+├── title_extractor.py     # Title extraction from metadata, H1, URL fallback
 ├── auth.py                # OAuth authentication & Google API clients
 ├── docs_converter.py      # Markdown → Google Docs formatting converter
 ├── html_cleaner.py        # BeautifulSoup HTML cleaning & noise removal
@@ -221,8 +269,10 @@ web-content-parser/
 ## CLI Options
 
 ```bash
-python fetch_markdown.py [OPTIONS] urls...
+web-content-parser [OPTIONS] [urls...]
 ```
+
+If no URLs are provided, the tool enters **interactive mode**.
 
 | Option                      | Description                                   | Default      |
 | --------------------------- | --------------------------------------------- | ------------ |
@@ -236,20 +286,23 @@ python fetch_markdown.py [OPTIONS] urls...
 ### Examples
 
 ```bash
-# Basic usage
-python fetch_markdown.py "https://example.com/article"
+# Interactive mode (enter URLs one at a time)
+web-content-parser
 
-# Disable cleaning for faster processing
-python fetch_markdown.py --no-clean "https://example.com/article"
+# Interactive mode with options
+web-content-parser --no-clean
+
+# Direct mode with single URL
+web-content-parser "https://example.com/article"
+
+# Direct mode with multiple URLs
+web-content-parser url1 url2 url3
 
 # More aggressive pruning (keeps less content)
-python fetch_markdown.py --pruning-threshold 0.6 "https://example.com/article"
+web-content-parser --pruning-threshold 0.6 "https://example.com/article"
 
 # Enable short paragraph filtering (remove blocks < 30 words)
-python fetch_markdown.py --min-words 30 "https://example.com/article"
-
-# Multiple URLs
-python fetch_markdown.py url1 url2 url3
+web-content-parser --min-words 30 "https://example.com/article"
 ```
 
 ## Configuration
@@ -262,7 +315,7 @@ python fetch_markdown.py url1 url2 url3
   - **Why**: Google Docs/Drive APIs have connection pooling and rate limits that serialize some operations
   - **Benefit**: Still significantly faster, and content fetching (the slowest part) is fully parallelized
 - **Timeout**: 30s for aiohttp, 45s for Playwright
-- **Retries**: 2 per-URL retries + 3 batch-level retry rounds
+- **Retries**: 3 batch-level retry rounds for failed URLs
 - **Target folder**: "Resources" in Google Drive (customizable in `fetch_markdown.py`)
 - **Startup cost**: one-time Drive cache build (faster reuse on larger batches)
 
