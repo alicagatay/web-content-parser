@@ -134,7 +134,7 @@ This opens a full-screen UI with a centered input box:
 - Type a URL and press Enter to add it to the list
 - Type **"ready"** to start processing
 - Type **"exit"** to quit
-- After processing completes, the interactive prompt returns so you can enter more URLs
+- After processing completes, the summary stays on screen — scroll to review, then press **"q"** to return to the interactive prompt for more URLs
 - Ctrl+C and Ctrl+D are disabled — use "exit" to quit
 
 ### Direct Mode
