@@ -580,7 +580,7 @@ def _render_screen(
     # Compact fallback for very small terminals
     if cols < 40 or rows < 10:
         put(1, 1, f"{_ESC_BOLD}Web Content Parser{_ESC_RESET}")
-        put(2, 1, 'Type URLs, then "ready" to start.')
+        put(2, 1, 'Type URLs, "ready" to start, "exit" to quit.')
         if urls:
             put(3, 1, f"URLs: {len(urls)} added")
         input_row = min(rows, 4 if urls else 3)
@@ -592,7 +592,7 @@ def _render_screen(
     # Content text
     title = "Web Content Parser"
     instr1 = 'Enter URLs one at a time.'
-    instr2 = 'Type "ready" to start. Ctrl+C twice to exit.'
+    instr2 = 'Type "ready" to start, "exit" to quit.'
 
     # Calculate how many URL lines we can show
     fixed_lines = 7  # title + gap + 2 instructions + gap + prompt + error/status
@@ -735,10 +735,10 @@ def _read_input(row: int, col: int, max_display: int) -> str:
                     chars.pop(pos - 1)
                     pos -= 1
                     refresh()
-            elif ch == '\x03':  # Ctrl+C
-                raise KeyboardInterrupt
-            elif ch == '\x04':  # Ctrl+D
-                raise EOFError
+            elif ch == '\x03':  # Ctrl+C — ignored
+                continue
+            elif ch == '\x04':  # Ctrl+D — ignored
+                continue
             elif ch == '\x01':  # Ctrl+A (Home)
                 pos = 0
                 refresh()
@@ -786,7 +786,6 @@ def _read_input(row: int, col: int, max_display: int) -> str:
 
 def interactive_prompt() -> list[str]:
     """Interactive URL entry mode with centered Neovim-style UI."""
-    import time
     import shutil
     import signal
 
@@ -794,7 +793,6 @@ def interactive_prompt() -> list[str]:
     is_tty = stderr.isatty()
 
     urls: list[str] = []
-    last_ctrl_c = 0.0
     error_msg = ""
     status_msg = ""
 
@@ -816,7 +814,7 @@ def interactive_prompt() -> list[str]:
     def enter_ui():
         if not is_tty:
             stderr.write("Web Content Parser - Interactive Mode\n")
-            stderr.write('Enter URLs one at a time, then type "ready" to start.\n\n')
+            stderr.write('Enter URLs one at a time. Type "ready" to start, "exit" to quit.\n\n')
             return
         stderr.write(_ESC_ALT_SCREEN_ON)
         stderr.flush()
@@ -857,6 +855,10 @@ def interactive_prompt() -> list[str]:
                     draw()
                     continue
 
+                if raw.lower() == "exit":
+                    leave_ui()
+                    sys.exit(0)
+
                 if raw.lower() == "ready":
                     break
 
@@ -869,20 +871,8 @@ def interactive_prompt() -> list[str]:
                 urls.append(normalized)
                 draw()
 
-            except KeyboardInterrupt:
-                now = time.monotonic()
-                if now - last_ctrl_c < 1.0:
-                    leave_ui()
-                    print("\nExiting.", file=sys.stderr)
-                    sys.exit(0)
-                last_ctrl_c = now
-                status_msg = "Press Ctrl+C again to exit."
-                error_msg = ""
-                draw()
-            except EOFError:
-                leave_ui()
-                print("\nExiting.", file=sys.stderr)
-                sys.exit(0)
+            except (KeyboardInterrupt, EOFError):
+                continue
     except BaseException:
         leave_ui()
         raise
@@ -904,15 +894,6 @@ def interactive_prompt() -> list[str]:
 if __name__ == "__main__":
     args = parse_args()
 
-    # Determine URLs: from args or interactive mode
-    if args.urls:
-        urls = args.urls
-    elif sys.stdin.isatty():
-        urls = interactive_prompt()
-    else:
-        print("Error: No URLs provided. In non-interactive mode, pass URLs as arguments.", file=sys.stderr)
-        sys.exit(1)
-
     # Configure extraction settings from CLI args
     extraction_config = ExtractionConfig(
         enable_cleaning=not args.no_clean,
@@ -923,13 +904,29 @@ if __name__ == "__main__":
         dynamic_threshold=not args.no_dynamic_threshold,
     )
 
-    # Print config summary
-    print("Extraction config:", file=sys.stderr)
-    print(f"  Cleaning: {'enabled' if extraction_config.enable_cleaning else 'disabled'}", file=sys.stderr)
-    print(f"  Pruning: {'enabled' if extraction_config.enable_pruning else 'disabled'}", file=sys.stderr)
-    if extraction_config.enable_pruning:
-        print(f"  Pruning threshold: {extraction_config.pruning_threshold}", file=sys.stderr)
-    print(f"  Min words per block: {extraction_config.min_words}", file=sys.stderr)
-    print(file=sys.stderr)
-
-    asyncio.run(main(urls, extraction_config))
+    if args.urls:
+        # CLI args mode: run once and exit
+        urls = args.urls
+        print("Extraction config:", file=sys.stderr)
+        print(f"  Cleaning: {'enabled' if extraction_config.enable_cleaning else 'disabled'}", file=sys.stderr)
+        print(f"  Pruning: {'enabled' if extraction_config.enable_pruning else 'disabled'}", file=sys.stderr)
+        if extraction_config.enable_pruning:
+            print(f"  Pruning threshold: {extraction_config.pruning_threshold}", file=sys.stderr)
+        print(f"  Min words per block: {extraction_config.min_words}", file=sys.stderr)
+        print(file=sys.stderr)
+        asyncio.run(main(urls, extraction_config))
+    elif sys.stdin.isatty():
+        # Interactive mode: loop until user types "exit"
+        while True:
+            urls = interactive_prompt()
+            print("Extraction config:", file=sys.stderr)
+            print(f"  Cleaning: {'enabled' if extraction_config.enable_cleaning else 'disabled'}", file=sys.stderr)
+            print(f"  Pruning: {'enabled' if extraction_config.enable_pruning else 'disabled'}", file=sys.stderr)
+            if extraction_config.enable_pruning:
+                print(f"  Pruning threshold: {extraction_config.pruning_threshold}", file=sys.stderr)
+            print(f"  Min words per block: {extraction_config.min_words}", file=sys.stderr)
+            print(file=sys.stderr)
+            asyncio.run(main(urls, extraction_config))
+    else:
+        print("Error: No URLs provided. In non-interactive mode, pass URLs as arguments.", file=sys.stderr)
+        sys.exit(1)
