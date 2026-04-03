@@ -58,6 +58,22 @@ _ESC_ALT_SCREEN_ON = "\033[?1049h"
 _ESC_ALT_SCREEN_OFF = "\033[?1049l"
 
 
+def _wait_for_q():
+    """Block until the user presses 'q'. Used between processing rounds."""
+    import tty, termios, os
+    print(f"\n{_ESC_DIM}Press q to continue...{_ESC_RESET}", file=sys.stderr)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch = os.read(fd, 1).decode("utf-8", errors="replace")
+            if ch.lower() == "q":
+                return
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 async def process_url(
     session: aiohttp.ClientSession,
     original_url: str,
@@ -927,6 +943,7 @@ if __name__ == "__main__":
             print(f"  Min words per block: {extraction_config.min_words}", file=sys.stderr)
             print(file=sys.stderr)
             asyncio.run(main(urls, extraction_config))
+            _wait_for_q()
     else:
         print("Error: No URLs provided. In non-interactive mode, pass URLs as arguments.", file=sys.stderr)
         sys.exit(1)
