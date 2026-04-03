@@ -30,7 +30,7 @@ A powerful Python CLI tool that fetches web content and automatically creates fo
 
 ### Reliability & UX
 
-- **Interactive CLI mode** - full-screen Neovim-style UI, type "ready" to start, "exit" to quit, loops after processing
+- **Interactive CLI mode** - full-screen centered UI, type "ready" to start, "exit" to quit, loops after processing
 - **Automatic retry** - failed URLs retry up to 3 batch-level rounds
 - **Automatic title extraction** - from metadata, H1 headings, or URL fallback
 - **Duplicate avoidance** - reuses existing Docs when a matching title already exists (recursive Drive search)
@@ -111,7 +111,7 @@ Run the command with no arguments to enter interactive mode:
 web-content-parser
 ```
 
-This opens a full-screen Neovim-style UI with a centered input box:
+This opens a full-screen UI with a centered input box:
 
 ```
 ~
