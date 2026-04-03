@@ -30,7 +30,7 @@ A powerful Python CLI tool that fetches web content and automatically creates fo
 
 ### Reliability & UX
 
-- **Interactive CLI mode** - enter URLs one at a time without quotes, type "ready" to start
+- **Interactive CLI mode** - full-screen Neovim-style UI, type "ready" to start, "exit" to quit, loops after processing
 - **Automatic retry** - failed URLs retry up to 3 batch-level rounds
 - **Automatic title extraction** - from metadata, H1 headings, or URL fallback
 - **Duplicate avoidance** - reuses existing Docs when a matching title already exists (recursive Drive search)
@@ -111,28 +111,31 @@ Run the command with no arguments to enter interactive mode:
 web-content-parser
 ```
 
-The tool will prompt you to enter URLs one at a time (no quotes needed):
+This opens a full-screen Neovim-style UI with a centered input box:
 
 ```
-============================================
-  Web Content Parser - Interactive Mode
-============================================
+~
+~
+                   Web Content Parser
 
-Enter URLs one at a time, then type "ready" to start.
-Press Ctrl+C twice to exit.
+                Enter URLs one at a time.
+              Type "ready" to start, "exit" to quit.
 
-[1] Enter a URL (or "ready" to start): https://example.com/article1
-  Added: https://example.com/article1
-[2] Enter a URL (or "ready" to start): https://example.com/article2
-  Added: https://example.com/article2
-[3] Enter a URL (or "ready" to start): ready
+                URLs:
+                  1. https://example.com/article1
+                  2. https://example.com/article2
 
-URLs to process (2):
-  1. https://example.com/article1
-  2. https://example.com/article2
+                > _
+
+~
+~
 ```
 
-To exit without processing, press **Ctrl+C twice** within 1 second.
+- Type a URL and press Enter to add it to the list
+- Type **"ready"** to start processing
+- Type **"exit"** to quit
+- After processing completes, the interactive prompt returns so you can enter more URLs
+- Ctrl+C and Ctrl+D are disabled — use "exit" to quit
 
 ### Direct Mode
 
