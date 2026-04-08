@@ -18,6 +18,12 @@ python fetch_markdown.py url1 url2 url3
 # With options
 python fetch_markdown.py --no-clean --pruning-threshold 0.6 --min-words 30 url1
 
+# Recursive mode: crawl all sub-pages into a single tabbed Google Doc
+python fetch_markdown.py --recursive "https://docs.example.com/guide"
+
+# Recursive mode with page limit (skips confirmation prompt)
+python fetch_markdown.py --recursive --max-pages 20 "https://docs.example.com/guide"
+
 # Install dependencies (pip)
 pip install -r requirements.txt
 
@@ -36,24 +42,28 @@ The pipeline flows: **URLs -> Parallel Fetch -> HTML Clean -> Content Prune -> M
 
 ### Module Responsibilities
 
-- **`fetch_markdown.py`** — Main CLI entry point and orchestrator. Contains `main()` async loop, `process_url()` with 6 extraction strategies, batch retry logic, CLI argument parsing. `ExtractionConfig` is created from CLI args and passed through the call chain (no global state).
+- **`fetch_markdown.py`** — Main CLI entry point and orchestrator. Contains `main()` async loop, `extract_url_content()` (extraction without doc creation), `process_url()` (extraction + doc creation), `main_recursive()` (recursive mode orchestrator), batch retry logic, CLI argument parsing, interactive mode with mode selection. `ExtractionConfig` is created from CLI args and passed through the call chain (no global state).
 - **`extraction.py`** — `ExtractionConfig` dataclass, `fetch_html()` for aiohttp fetching, `extract_with_multi_div()`, `extract_with_css_selectors()`, and `apply_extraction_pipeline()` for the clean/prune pipeline.
 - **`playwright_fetch.py`** — `fetch_with_playwright()` using a shared `BrowserContext` (created once in `main()`), and `smart_wait_for_content()` with combined CSS selector waiting.
-- **`google_drive.py`** — `create_google_doc()`, `_build_doc_title_cache_sync()`, `_find_existing_doc_id_recursive_sync()`, and `sanitize_doc_title()`. Google API services are created once in `main()` and passed as parameters.
+- **`google_drive.py`** — `create_google_doc()` (tags docs with `appProperties` for cross-mode dedup), `_build_doc_title_cache_sync()`, `find_standalone_docs_for_urls_sync()`, `find_all_tabbed_base_urls_sync()`, and `sanitize_doc_title()`. Google API services are created once in `main()` and passed as parameters.
 - **`title_extractor.py`** — `extract_title_from_metadata()` (trafilatura), `extract_h1_title()`, `fallback_name_from_url()`.
 - **`auth.py`** — OAuth2 flow for Google APIs. Loads/refreshes credentials from `token.json`, falls back to browser-based OAuth. Exports `get_docs_service()`, `get_drive_service()`, `find_folder_id()`.
 - **`html_cleaner.py`** — BeautifulSoup-based noise removal. `clean_html_for_extraction()` strips 60+ noise selectors (nav, ads, popups, etc.). `extract_main_content()` for targeted extraction. `filter_short_blocks()` for post-extraction markdown filtering.
 - **`content_filter.py`** — `PruningContentFilter` with `ContentScorer` that scores HTML elements on text density (40%), link density (30%), tag importance (20%), and class/ID patterns (10%). Configurable via `FilterConfig` dataclass.
 - **`docs_converter.py`** — `MarkdownToDocsConverter` class that parses markdown with `markdown-it-py` and builds Google Docs API `batchUpdate` requests. Handles headings, bold, italic, links, lists, code blocks. Uses reverse insertion strategy for correct index tracking.
+- **`recursive_crawler.py`** — URL discovery for recursive mode. `discover_urls()` tries sitemap.xml first (parsed with `xml.etree.ElementTree`), falls back to BFS link crawling with BeautifulSoup. `is_within_prefix()` enforces strict URL prefix boundaries. `CrawlConfig` dataclass for rate limiting and timeouts.
+- **`tabbed_doc.py`** — `create_tabbed_google_doc()` creates a single Google Doc with one tab per page using the Docs API `addDocumentTab` request. `_inject_tab_id()` post-processes batchUpdate requests to target specific tabs.
 
 ### Key Design Decisions
 
 - **Best-of-12 extraction**: Runs 6 strategies on each of 2 HTML sources (aiohttp + Playwright), selects the longest result. This maximizes content capture across diverse site structures.
-- **Doc title cache**: Built once per run via `_build_doc_title_cache_sync()` with recursive Drive folder traversal, avoiding repeated API calls for duplicate detection.
+- **Doc title cache**: Built once per run via `_build_doc_title_cache_sync()` with a single Drive folder query, avoiding repeated API calls for duplicate detection.
 - **Shared resources**: Google API services and Playwright browser context are created once in `main()` and passed through the call chain. No global mutable state.
 - **Single retry layer**: Only batch-level retries in `main()` (`MAX_RETRY_ROUNDS`). Per-fetch retry loops were removed to simplify retry reasoning.
 - **Concurrency**: 15 parallel tasks for both aiohttp and Playwright (`MAX_CONCURRENCY`, `PLAYWRIGHT_CONCURRENCY`). Google API rate limits mean actual speedup is ~2x, not 15x.
 - **Credentials files** (`credentials.json`, `token.json`) are gitignored and live in project root. Required for Google API access.
+- **Recursive mode**: Discovers sub-pages via sitemap or BFS crawl, extracts content from each, and creates a single tabbed Google Doc. Uses `extract_url_content()` (shared with normal mode) for content extraction. User confirms page count after discovery (or `--max-pages` to skip prompt). Strict URL prefix enforcement prevents crawling outside the target path.
+- **Cross-mode duplicate detection**: Both modes tag Google Drive files with `appProperties` metadata (`doc_mode`, `source_url`/`base_url`). Normal mode skips URLs already covered by a recursive doc's `base_url` prefix. Recursive mode deletes standalone docs whose `source_url` matches a sub-page. Zero extra API calls for tagging (merged into existing `files().update`).
 
 ### Constants
 
