@@ -28,12 +28,22 @@ A powerful Python CLI tool that fetches web content and automatically creates fo
 - **Stealth mode** - anti-detection headers and settings to bypass basic bot protection
 - **Automatic method selection** - always uses the extraction that gets the most content
 
+### Recursive Mode
+
+- **Crawl entire documentation sites** - provide a base URL, discover all sub-pages automatically
+- **Sitemap-first discovery** - tries sitemap.xml for fast, complete URL discovery
+- **BFS crawl fallback** - follows links from pages when no sitemap is available
+- **Strict URL prefix enforcement** - never crawls outside the target path (safe for sites like GitHub)
+- **Single tabbed Google Doc** - all pages combined into one doc with named tabs
+- **User confirmation** - shows discovered page count, lets you proceed, limit, or cancel
+- **Cross-mode duplicate detection** - deletes standalone docs that are now covered by the recursive doc
+
 ### Reliability & UX
 
-- **Interactive CLI mode** - full-screen centered UI, type "ready" to start, "exit" to quit, loops after processing
+- **Interactive CLI mode** - full-screen centered UI with mode selection (Normal/Recursive), loops after processing
 - **Automatic retry** - failed URLs retry up to 3 batch-level rounds
 - **Automatic title extraction** - from metadata, H1 headings, or URL fallback
-- **Duplicate avoidance** - reuses existing Docs when a matching title already exists (recursive Drive search)
+- **Cross-mode duplicate detection** - standalone docs are skipped if covered by a recursive doc, and vice versa
 - **Real-time progress bar** - shows completion status, speed, and extraction method used
 - **Detailed logging** - shows extraction method, content length, and document title for each URL
 - **Configurable CLI** - tune cleaning, pruning, and filtering via command-line flags
@@ -111,30 +121,29 @@ Run the command with no arguments to enter interactive mode:
 web-content-parser
 ```
 
-This opens a full-screen UI with a centered input box:
+This opens a full-screen UI starting with mode selection:
 
 ```
 ~
 ~
-                   Web Content Parser
+              Web Content Parser
+              Type "exit" to quit.
 
-                Enter URLs one at a time.
-              Type "ready" to start, "exit" to quit.
+              Select mode:
+              [1] Normal    - process URLs individually
+              [2] Recursive - crawl & combine into one doc
 
-                URLs:
-                  1. https://example.com/article1
-                  2. https://example.com/article2
-
-                > _
-
+              > _
 ~
 ~
 ```
 
-- Type a URL and press Enter to add it to the list
-- Type **"ready"** to start processing
-- Type **"exit"** to quit
-- After processing completes, the summary stays on screen — scroll to review, then press **"q"** to return to the interactive prompt for more URLs
+After selecting a mode, you enter the URL entry screen:
+
+- **Normal mode**: Type URLs one at a time, then **"ready"** to start processing
+- **Recursive mode**: Type a single base URL and it starts automatically
+- Type **"exit"** at any point to quit
+- After processing completes, press **"q"** to return to mode selection for more URLs
 - Ctrl+C and Ctrl+D are disabled — use "exit" to quit
 
 ### Direct Mode
@@ -142,7 +151,14 @@ This opens a full-screen UI with a centered input box:
 You can also pass URLs directly as command-line arguments:
 
 ```bash
+# Normal mode (default)
 web-content-parser "https://example.com/article1" "https://example.com/article2"
+
+# Recursive mode
+web-content-parser --recursive "https://docs.example.com/guide"
+
+# Recursive mode with page limit (skips confirmation prompt)
+web-content-parser --recursive --max-pages 20 "https://docs.example.com/guide"
 ```
 
 CLI flags work with both modes:
@@ -252,15 +268,17 @@ All Google Docs are created in your **Resources** folder with:
 
 ```
 web-content-parser/
-├── fetch_markdown.py      # Main CLI entry point & orchestrator
+├── fetch_markdown.py      # Main CLI entry point & orchestrator (normal + recursive modes)
 ├── extraction.py          # ExtractionConfig, HTML fetching, extraction strategies
 ├── playwright_fetch.py    # Playwright browser fetching & smart content waiting
-├── google_drive.py        # Google Doc creation, caching, folder management
+├── google_drive.py        # Google Doc creation, caching, cross-mode dedup helpers
 ├── title_extractor.py     # Title extraction from metadata, H1, URL fallback
 ├── auth.py                # OAuth authentication & Google API clients
 ├── docs_converter.py      # Markdown → Google Docs formatting converter
 ├── html_cleaner.py        # BeautifulSoup HTML cleaning & noise removal
 ├── content_filter.py      # PruningContentFilter for content scoring
+├── recursive_crawler.py   # URL discovery via sitemap + BFS crawl for recursive mode
+├── tabbed_doc.py          # Tabbed Google Doc creation (one tab per page)
 ├── requirements.txt       # Python dependencies
 ├── credentials.json       # OAuth client secrets (git-ignored)
 ├── token.json             # User access tokens (git-ignored)
@@ -285,11 +303,14 @@ If no URLs are provided, the tool enters **interactive mode**.
 | `--min-words INT`           | Minimum words per markdown block              | 0 (disabled) |
 | `--min-word-threshold INT`  | Minimum words for pruning filter              | 10           |
 | `--no-dynamic-threshold`    | Disable dynamic threshold adjustment          | Enabled      |
+| `--recursive`               | Crawl all sub-pages and combine into one tabbed Google Doc | Off |
+| `--max-pages INT`           | Max pages in recursive mode (skips confirmation prompt) | None (ask user) |
+| `--crawl-delay FLOAT`       | Delay between page fetches during crawling (seconds) | 0.5 |
 
 ### Examples
 
 ```bash
-# Interactive mode (enter URLs one at a time)
+# Interactive mode (select Normal or Recursive, then enter URLs)
 web-content-parser
 
 # Interactive mode with options
@@ -300,6 +321,12 @@ web-content-parser "https://example.com/article"
 
 # Direct mode with multiple URLs
 web-content-parser url1 url2 url3
+
+# Recursive mode: crawl all sub-pages into a single tabbed doc
+web-content-parser --recursive "https://docs.example.com/guide"
+
+# Recursive mode with page limit
+web-content-parser --recursive --max-pages 20 "https://docs.example.com/guide"
 
 # More aggressive pruning (keeps less content)
 web-content-parser --pruning-threshold 0.6 "https://example.com/article"
@@ -522,13 +549,22 @@ Sensitive files are excluded from git via `.gitignore`:
 - Preserves headers, code blocks, lists, blockquotes
 - Extracts title from metadata, H1, or URL
 
-#### 7. **Document Creation** (`docs_converter.py`):
+#### 7. **Document Creation** (`docs_converter.py`, `google_drive.py`, `tabbed_doc.py`):
 
-- Builds a one-time Drive title cache (recursive folder scan)
+- **Normal mode**: Creates one Google Doc per URL, tagged with `appProperties` for cross-mode dedup
+- **Recursive mode**: Creates a single tabbed Google Doc (one tab per page), tagged with base URL
+- Builds a one-time Drive title cache (single folder query)
 - Reuses existing Docs by title if found; otherwise creates new
 - Parses markdown with `markdown-it-py`
 - Converts to Google Docs API `batchUpdate` requests
 - Applies formatting in single batch operation
+
+#### 8. **Cross-Mode Duplicate Detection** (`google_drive.py`):
+
+- Both modes tag docs with `appProperties` metadata (invisible to users, queryable via Drive API)
+- **Normal mode** skips URLs already covered by a recursive doc's `base_url` prefix
+- **Recursive mode** finds and deletes standalone docs whose source URL matches a sub-page
+- Zero extra API calls for tagging (merged into existing `files().update` call)
 
 ## Why This Approach?
 
