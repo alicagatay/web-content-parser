@@ -10,6 +10,7 @@ from collections import deque
 
 from auth import get_docs_service, get_drive_service
 from docs_converter import convert_markdown_to_doc_requests
+from recursive_crawler import normalize_url
 
 
 def sanitize_doc_title(name: str) -> str:
@@ -106,7 +107,7 @@ def _build_doc_title_cache_sync(
 ) -> dict[str, tuple[str, bool]]:
     """
     Synchronous helper: Build a cache of document titles to IDs by
-    recursively traversing the root folder and all subfolders.
+    listing all docs in the root folder (single query, no recursion).
 
     Args:
         drive_service: Authenticated Google Drive service
@@ -116,66 +117,30 @@ def _build_doc_title_cache_sync(
         dict[str, tuple[str, bool]]: Mapping of document title -> (document ID, created_this_run)
     """
     doc_cache: dict[str, tuple[str, bool]] = {}
-    folder_query_template = (
-        "'{folder_id}' in parents and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    doc_query_template = (
-        "'{folder_id}' in parents and "
-        "mimeType='application/vnd.google-apps.document' and trashed=false"
+    query = (
+        f"'{root_folder_id}' in parents and "
+        f"mimeType='application/vnd.google-apps.document' and trashed=false"
     )
 
-    queue = deque([root_folder_id])
-    visited = set()
+    page_token = None
+    while True:
+        results = drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='nextPageToken, files(id, name)',
+            pageSize=1000,
+            pageToken=page_token
+        ).execute()
 
-    while queue:
-        folder_id = queue.popleft()
-        if folder_id in visited:
-            continue
-        visited.add(folder_id)
+        for doc in results.get('files', []):
+            doc_id = doc.get('id')
+            doc_name = doc.get('name')
+            if doc_id and doc_name and doc_name not in doc_cache:
+                doc_cache[doc_name] = (doc_id, False)
 
-        # List documents in this folder
-        page_token = None
-        while True:
-            doc_query = doc_query_template.format(folder_id=folder_id)
-            doc_results = drive_service.files().list(
-                q=doc_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name)',
-                pageSize=1000,
-                pageToken=page_token
-            ).execute()
-
-            for doc in doc_results.get('files', []):
-                doc_id = doc.get('id')
-                doc_name = doc.get('name')
-                if doc_id and doc_name and doc_name not in doc_cache:
-                    doc_cache[doc_name] = (doc_id, False)
-
-            page_token = doc_results.get('nextPageToken')
-            if not page_token:
-                break
-
-        # Queue subfolders
-        page_token = None
-        while True:
-            folder_query = folder_query_template.format(folder_id=folder_id)
-            folder_results = drive_service.files().list(
-                q=folder_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name)',
-                pageSize=1000,
-                pageToken=page_token
-            ).execute()
-
-            for folder in folder_results.get('files', []):
-                folder_id_child = folder.get('id')
-                if folder_id_child:
-                    queue.append(folder_id_child)
-
-            page_token = folder_results.get('nextPageToken')
-            if not page_token:
-                break
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
 
     return doc_cache
 
@@ -184,8 +149,9 @@ async def create_google_doc(
     markdown_content: str,
     title: str,
     folder_id: str,
+    source_url: str | None = None,
     doc_cache: dict[str, tuple[str, bool]] | None = None,
-    cache_lock: asyncio.Lock | None = None
+    cache_lock: asyncio.Lock | None = None,
 ) -> str:
     """
     Create a Google Doc from markdown content.
@@ -251,13 +217,20 @@ async def create_google_doc(
                 doc_cache[title] = (doc_id, True)
 
         if not (existing_doc_id and created_this_run):
-            # Move it to the target folder and transfer ownership to you
+            # Move to target folder and tag with source URL metadata
+            update_body = {}
+            if source_url:
+                update_body['appProperties'] = {
+                    'doc_mode': 'standalone',
+                    'source_url': normalize_url(source_url)[:124],
+                }
             await asyncio.to_thread(
                 lambda: drive_service.files().update(
                     fileId=doc_id,
                     addParents=folder_id,
                     removeParents='root',
-                    fields='id, parents'
+                    body=update_body,
+                    fields='id, parents',
                 ).execute()
             )
 
@@ -286,3 +259,84 @@ async def create_google_doc(
 
     except Exception as e:
         raise RuntimeError(f"Failed to create Google Doc: {e}")
+
+
+def find_standalone_docs_for_urls_sync(
+    drive_service,
+    folder_id: str,
+    urls: list[str],
+) -> list[tuple[str, str, str]]:
+    """Find standalone docs whose source_url matches any of the given URLs.
+
+    Returns list of (doc_id, doc_name, source_url) tuples.
+    """
+    normalized_set = {normalize_url(u) for u in urls}
+
+    query = (
+        f"'{folder_id}' in parents and "
+        f"mimeType='application/vnd.google-apps.document' and "
+        f"trashed=false and "
+        f"appProperties has {{ key='doc_mode' and value='standalone' }}"
+    )
+
+    matches = []
+    page_token = None
+    while True:
+        results = drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='nextPageToken, files(id, name, appProperties)',
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+
+        for doc in results.get('files', []):
+            props = doc.get('appProperties', {})
+            source = props.get('source_url', '')
+            if source in normalized_set:
+                matches.append((doc['id'], doc['name'], source))
+
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
+
+    return matches
+
+
+def find_all_tabbed_base_urls_sync(
+    drive_service,
+    folder_id: str,
+) -> list[tuple[str, str]]:
+    """Find all tabbed (recursive mode) docs and return their base URLs.
+
+    Returns list of (doc_id, base_url) tuples.
+    """
+    query = (
+        f"'{folder_id}' in parents and "
+        f"mimeType='application/vnd.google-apps.document' and "
+        f"trashed=false and "
+        f"appProperties has {{ key='doc_mode' and value='tabbed' }}"
+    )
+
+    results_list = []
+    page_token = None
+    while True:
+        results = drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='nextPageToken, files(id, appProperties)',
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+
+        for doc in results.get('files', []):
+            props = doc.get('appProperties', {})
+            base_url = props.get('base_url', '')
+            if base_url:
+                results_list.append((doc['id'], base_url))
+
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
+
+    return results_list
