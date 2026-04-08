@@ -56,6 +56,10 @@ def is_within_prefix(candidate_url: str, base_url: str) -> bool:
     cand_path = p_cand.path.rstrip("/") or "/"
     base_path = p_base.path.rstrip("/") or "/"
 
+    # Root path: all paths on the same domain are within prefix
+    if base_path == "/":
+        return True
+
     # Exact match or child path (must have / after prefix to prevent
     # /docs matching /documentation)
     return cand_path == base_path or cand_path.startswith(base_path + "/")

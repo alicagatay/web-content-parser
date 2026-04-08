@@ -16,6 +16,18 @@ from google_drive import sanitize_doc_title
 from recursive_crawler import normalize_url
 
 
+def _truncate_to_word(text: str, max_len: int) -> str:
+    """Truncate text to max_len, cutting at the last word boundary."""
+    if len(text) <= max_len:
+        return text
+    truncated = text[:max_len]
+    # Find last space to avoid cutting mid-word
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        return truncated[:last_space].rstrip()
+    return truncated
+
+
 def _inject_tab_id(requests: list[dict], tab_id: str) -> list[dict]:
     """Add tabId to all location/range objects in batchUpdate requests.
 
@@ -121,13 +133,18 @@ async def create_tabbed_google_doc(
     seen_titles: set[str] = set()
     tab_titles: list[str] = []
     for url, title, md in pages:
-        tab_title = title[:100]
+        tab_title = _truncate_to_word(title, 50)
         if tab_title in seen_titles:
             # Append the last path segment to disambiguate
             from urllib.parse import urlparse
             path = urlparse(url).path.rstrip("/")
             slug = path.split("/")[-1] if "/" in path else path
-            tab_title = f"{title[:90]} ({slug})"
+            suffix = f" ({slug})"
+            max_title_len = 50 - len(suffix)
+            tab_title = _truncate_to_word(title, max_title_len) + suffix
+            # If slug itself is too long, hard-truncate the whole thing
+            if len(tab_title) > 50:
+                tab_title = title[:47] + "..."
         seen_titles.add(tab_title)
         tab_titles.append(tab_title)
 
