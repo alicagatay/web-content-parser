@@ -22,6 +22,8 @@ from google_drive import (
     sanitize_doc_title,
     _build_doc_title_cache_sync,
     create_google_doc,
+    find_standalone_docs_for_urls_sync,
+    find_all_tabbed_base_urls_sync,
 )
 from title_extractor import (
     extract_title_from_metadata,
@@ -36,6 +38,8 @@ from extraction import (
     apply_extraction_pipeline,
 )
 from playwright_fetch import fetch_with_playwright
+from recursive_crawler import CrawlConfig, discover_urls, normalize_url, is_within_prefix
+from tabbed_doc import create_tabbed_google_doc
 
 TIMEOUT_SECS = 30
 DRIVE_FOLDER_NAME = "Resources"  # Google Drive folder name for created docs
@@ -74,28 +78,21 @@ def _wait_for_q():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-async def process_url(
+async def extract_url_content(
     session: aiohttp.ClientSession,
     original_url: str,
-    folder_id: str,
-    semaphore: asyncio.Semaphore,
     pw_context: BrowserContext | None,
     playwright_sem: asyncio.Semaphore | None,
-    doc_cache: dict[str, tuple[str, bool]] | None,
-    cache_lock: asyncio.Lock | None,
     config: ExtractionConfig,
-) -> tuple[str, str, str, bool, str, int]:
+) -> tuple[str, str, str, str, int]:
     """
-    Process a single URL: fetch HTML, extract markdown, create Google Doc.
+    Fetch HTML and extract markdown content from a URL (no doc creation).
+
+    Caller is responsible for concurrency control (semaphore).
 
     Returns:
-        (original_url, doc_url, doc_title, used_title, extraction_method, content_length)
+        (original_url, doc_title, markdown_with_source, extraction_method, content_length)
     """
-    html = None
-    md = None
-    extraction_method = ""
-    content_length = 0
-
     def run_extractions_on_html(
         source_name: str,
         raw_html: str,
@@ -266,7 +263,6 @@ async def process_url(
 
     # Try to extract title: metadata → H1 → URL fallback
     title = extract_title_from_metadata(html, original_url)
-    used_metadata = bool(title)
 
     if not title:
         title = extract_h1_title(md)
@@ -284,16 +280,41 @@ async def process_url(
         f"{md}"
     )
 
+    return (original_url, doc_title, md_with_source, extraction_method, content_length)
+
+
+async def process_url(
+    session: aiohttp.ClientSession,
+    original_url: str,
+    folder_id: str,
+    semaphore: asyncio.Semaphore,
+    pw_context: BrowserContext | None,
+    playwright_sem: asyncio.Semaphore | None,
+    doc_cache: dict[str, tuple[str, bool]] | None,
+    cache_lock: asyncio.Lock | None,
+    config: ExtractionConfig,
+) -> tuple[str, str, str, bool, str, int]:
+    """
+    Process a single URL: fetch HTML, extract markdown, create Google Doc.
+
+    Returns:
+        (original_url, doc_url, doc_title, used_title, extraction_method, content_length)
+    """
+    _, doc_title, md_with_source, extraction_method, content_length = await extract_url_content(
+        session, original_url, pw_context, playwright_sem, config
+    )
+
     # Create Google Doc
     doc_url = await create_google_doc(
         md_with_source,
         doc_title,
         folder_id,
+        source_url=original_url,
         doc_cache=doc_cache,
-        cache_lock=cache_lock
+        cache_lock=cache_lock,
     )
 
-    return (original_url, doc_url, doc_title, used_metadata or bool(title), extraction_method, content_length)
+    return (original_url, doc_url, doc_title, bool(doc_title), extraction_method, content_length)
 
 
 async def process_url_safe(
@@ -365,6 +386,33 @@ async def main(urls: list[str], config: ExtractionConfig) -> None:
         print(f"Warning: Failed to build doc cache, falling back to recursive lookups: {e}", file=sys.stderr)
         doc_cache = None
         cache_lock = None
+
+    # Cross-mode dedup: skip URLs already covered by a recursive (tabbed) doc
+    try:
+        tabbed_docs = await asyncio.to_thread(
+            find_all_tabbed_base_urls_sync, drive_service, folder_id
+        )
+        if tabbed_docs:
+            tabbed_base_urls = [base_url for _, base_url in tabbed_docs]
+            filtered = []
+            skipped = []
+            for url in urls_to_process:
+                norm = normalize_url(url)
+                if any(is_within_prefix(norm, base) for base in tabbed_base_urls):
+                    skipped.append(url)
+                else:
+                    filtered.append(url)
+            if skipped:
+                print(f"Skipped {len(skipped)} URL(s) already in recursive docs:", file=sys.stderr)
+                for url in skipped:
+                    print(f"  ↺ {url}", file=sys.stderr)
+                urls_to_process = filtered
+    except Exception as e:
+        print(f"Warning: Cross-mode dedup check failed: {e}", file=sys.stderr)
+
+    if not urls_to_process:
+        print("\n✓ All URLs already covered by recursive docs. Nothing to do.", file=sys.stderr)
+        return
 
     # Launch Playwright browser with shared context
     async with async_playwright() as p:
@@ -468,6 +516,201 @@ async def main(urls: list[str], config: ExtractionConfig) -> None:
         print(f"  (Failed URLs were retried {MAX_RETRY_ROUNDS - 1} times)", file=sys.stderr)
 
 
+async def main_recursive(
+    base_url: str,
+    config: ExtractionConfig,
+    crawl_config: CrawlConfig | None = None,
+    max_pages: int | None = None,
+) -> None:
+    """
+    Recursive mode: discover sub-pages, extract all, create single tabbed doc.
+
+    Args:
+        base_url: The base URL prefix to crawl under
+        config: Extraction configuration
+        crawl_config: Crawl configuration (rate limit, timeout)
+        max_pages: If set, skip confirmation prompt and cap at this number
+    """
+    if crawl_config is None:
+        crawl_config = CrawlConfig()
+
+    # --- Setup (same as main()) ---
+    try:
+        drive_service = get_drive_service()
+    except Exception as e:
+        print(f"\n❌ Error creating Google API services: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        print("Locating Google Drive folder...", file=sys.stderr)
+        folder_id = find_folder_id(DRIVE_FOLDER_NAME, drive_service=drive_service)
+        print(f"✓ Found '{DRIVE_FOLDER_NAME}' folder\n", file=sys.stderr)
+    except Exception as e:
+        print(f"\n❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECS)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        # --- Phase 1: Discovery ---
+        print("Discovering pages...", file=sys.stderr)
+        discovered_urls = await discover_urls(base_url, session, crawl_config)
+
+        if not discovered_urls:
+            print(f"\n❌ No pages found under {base_url}", file=sys.stderr)
+            return
+
+        # --- Phase 2: User confirmation ---
+        urls_to_process = discovered_urls
+
+        if max_pages is not None:
+            # CLI override: skip prompt, cap silently
+            urls_to_process = discovered_urls[:max_pages]
+            print(f"✓ Found {len(discovered_urls)} pages (capped to {max_pages})\n", file=sys.stderr)
+        else:
+            # Show discovered URLs and ask for confirmation
+            print(f"\nDiscovered {len(discovered_urls)} pages under {base_url}\n", file=sys.stderr)
+            for i, url in enumerate(discovered_urls, 1):
+                print(f"  {i}. {url}", file=sys.stderr)
+
+            print(f"\nProceed with all {len(discovered_urls)} pages? [Y/n/NUMBER]", file=sys.stderr)
+            try:
+                answer = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.", file=sys.stderr)
+                return
+
+            if answer == "n":
+                print("Cancelled.", file=sys.stderr)
+                return
+            elif answer.isdigit():
+                limit = int(answer)
+                urls_to_process = discovered_urls[:limit]
+                print(f"Processing first {limit} pages.\n", file=sys.stderr)
+            elif answer in ("", "y", "yes"):
+                print(f"Processing all {len(discovered_urls)} pages.\n", file=sys.stderr)
+            else:
+                print(f"Invalid input: '{answer}'. Cancelled.", file=sys.stderr)
+                return
+
+        # --- Phase 3: Extraction ---
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            pw_context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={'width': 1920, 'height': 1080},
+                locale='en-US',
+                timezone_id='America/New_York',
+                permissions=['geolocation'],
+                java_script_enabled=True,
+            )
+            await pw_context.set_extra_http_headers({
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1',
+            })
+            await pw_context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
+            playwright_sem = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
+            semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
+            # Extract content from all URLs concurrently
+            extracted: list[tuple[str, str, str, str, int]] = []
+            failed: list[tuple[str, Exception]] = []
+
+            async def extract_safe(url: str):
+                try:
+                    async with semaphore:
+                        return await extract_url_content(
+                            session, url, pw_context, playwright_sem, config
+                        )
+                except Exception as e:
+                    return (url, e)
+
+            tasks = [asyncio.create_task(extract_safe(u)) for u in urls_to_process]
+            results = []
+            with tqdm(total=len(urls_to_process), desc="Extracting", unit="page") as pbar:
+                for coro in asyncio.as_completed(tasks):
+                    result = await coro
+                    results.append(result)
+                    pbar.update(1)
+
+            await pw_context.close()
+            await browser.close()
+
+        # Separate successes from failures
+        for result in results:
+            if isinstance(result[1], Exception):
+                failed.append((result[0], result[1]))
+            else:
+                extracted.append(result)
+
+        if not extracted:
+            print(f"\n❌ All {len(urls_to_process)} pages failed extraction.", file=sys.stderr)
+            return
+
+        # Sort extracted pages by URL depth then alphabetically (match discovery order)
+        extracted.sort(key=lambda x: (x[0].count('/'), x[0].lower()))
+
+        # --- Phase 4: Doc creation ---
+        # Build pages list: (url, title, markdown)
+        pages = [(url, title, md) for url, title, md, method, length in extracted]
+
+        # Generate doc title from base URL
+        parsed = urlparse(base_url)
+        path_part = parsed.path.strip("/").replace("/", " - ")
+        if path_part:
+            generated_title = f"{parsed.netloc} - {path_part}"
+        else:
+            generated_title = parsed.netloc
+
+        print(f"\nCreating tabbed Google Doc: \"{generated_title}\"", file=sys.stderr)
+        doc_url = await create_tabbed_google_doc(pages, generated_title, folder_id, base_url=base_url)
+
+        # --- Phase 4b: Clean up standalone docs now covered by this recursive doc ---
+        try:
+            processed_urls = [url for url, _, _ in pages]
+            standalone_matches = await asyncio.to_thread(
+                find_standalone_docs_for_urls_sync, drive_service, folder_id, processed_urls
+            )
+            if standalone_matches:
+                for doc_id, doc_name, source in standalone_matches:
+                    try:
+                        await asyncio.to_thread(
+                            lambda did=doc_id: drive_service.files().delete(fileId=did).execute()
+                        )
+                        print(f"  Deleted standalone doc: \"{doc_name}\"", file=sys.stderr)
+                    except Exception as e:
+                        print(f"  Warning: Failed to delete \"{doc_name}\": {e}", file=sys.stderr)
+                print(f"  Cleaned up {len(standalone_matches)} standalone doc(s)", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Standalone cleanup failed: {e}", file=sys.stderr)
+
+        # --- Phase 5: Report ---
+        print(f"\n✓ Recursive crawl complete:", file=sys.stderr)
+        print(f"  Discovered: {len(discovered_urls)} pages under {base_url}", file=sys.stderr)
+        print(f"  Extracted:  {len(extracted)}/{len(urls_to_process)} succeeded, {len(failed)} failed", file=sys.stderr)
+        print(f"  Document:   {doc_url} ({len(extracted)} tabs)", file=sys.stderr)
+
+        if failed:
+            print(f"\n  Failed pages:", file=sys.stderr)
+            for url, err in failed:
+                print(f"    - {url} ({err})", file=sys.stderr)
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -479,11 +722,18 @@ Examples:
   web-content-parser "https://example.com/article"
   web-content-parser --no-clean "https://example.com/article"
   web-content-parser --pruning-threshold 0.6 --min-words 30 url1 url2
+  web-content-parser --recursive "https://docs.example.com/guide"
+  web-content-parser --recursive --max-pages 20 "https://docs.example.com/guide"
 
 Configuration:
   The extraction pipeline cleans HTML and prunes low-quality content by default.
   Use --no-clean and --no-prune to disable these features for faster processing.
   Run without URLs to enter interactive mode (enter URLs one at a time).
+
+Recursive mode:
+  Use --recursive to crawl all sub-pages under a URL prefix and combine them
+  into a single Google Doc with one tab per page. Use --max-pages to limit
+  the number of pages without a confirmation prompt.
         """
     )
 
@@ -538,6 +788,29 @@ Configuration:
         help='Disable dynamic threshold adjustment in pruning'
     )
 
+    # Recursive mode options
+    parser.add_argument(
+        '--recursive',
+        action='store_true',
+        help='Crawl all sub-pages under the given URL and combine into a single tabbed Google Doc'
+    )
+
+    parser.add_argument(
+        '--max-pages',
+        type=int,
+        default=None,
+        metavar='INT',
+        help='Maximum pages to process in recursive mode. Skips confirmation prompt when set.'
+    )
+
+    parser.add_argument(
+        '--crawl-delay',
+        type=float,
+        default=0.5,
+        metavar='FLOAT',
+        help='Delay between page fetches during recursive crawling (seconds). Default: 0.5'
+    )
+
     return parser.parse_args()
 
 
@@ -560,6 +833,7 @@ def _render_screen(
     urls: list[str],
     error_msg: str,
     status_msg: str,
+    mode: str = "normal",
 ) -> tuple[str, int, int]:
     """
     Build full screen content with ANSI positioning.
@@ -605,13 +879,19 @@ def _render_screen(
             put(r, 1, "")
         return "".join(buf), input_row, 3
 
-    # Content text
+    # Content text varies by mode
     title = "Web Content Parser"
-    instr1 = 'Enter URLs one at a time.'
-    instr2 = 'Type "ready" to start, "exit" to quit.'
+    if mode == "recursive":
+        mode_tag = "[Recursive Mode]"
+        instr1 = 'Enter a base URL to crawl all sub-pages.'
+        instr2 = 'Type "exit" to quit.'
+    else:
+        mode_tag = "[Normal Mode]"
+        instr1 = 'Enter URLs one at a time.'
+        instr2 = 'Type "ready" to start, "exit" to quit.'
 
     # Calculate how many URL lines we can show
-    fixed_lines = 7  # title + gap + 2 instructions + gap + prompt + error/status
+    fixed_lines = 8  # title + mode_tag + gap + 2 instructions + gap + prompt + error/status
     url_header_lines = 1 if urls else 0
     available = max(0, rows - fixed_lines - url_header_lines - 4)
 
@@ -623,7 +903,7 @@ def _render_screen(
         overflow = 0
 
     # Total content height
-    content_h = 5 + url_header_lines + show_count + (1 if overflow else 0) + 2
+    content_h = 6 + url_header_lines + show_count + (1 if overflow else 0) + 2
     top = max(1, (rows - content_h) // 2)
 
     content_rows: set[int] = set()
@@ -631,6 +911,11 @@ def _render_screen(
 
     # Title
     put_box(r, title, bold=True)
+    content_rows.add(r)
+    r += 1
+
+    # Mode tag
+    put_box(r, mode_tag, dim=True)
     content_rows.add(r)
     r += 1
 
@@ -800,8 +1085,100 @@ def _read_input(row: int, col: int, max_display: int) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def interactive_prompt() -> list[str]:
-    """Interactive URL entry mode with centered Neovim-style UI."""
+def _render_mode_screen(
+    cols: int,
+    rows: int,
+    error_msg: str,
+) -> tuple[str, int, int]:
+    """Build mode selection screen. Returns (screen_text, input_row, input_col)."""
+    buf: list[str] = []
+    box_w = min(60, cols - 4)
+    box_left = max(1, (cols - box_w) // 2 + 1)
+
+    def put(row: int, col: int, text: str):
+        buf.append(f"\033[{row};{col}H{_ESC_CLEAR_LINE}{text}")
+
+    def put_box(row: int, text: str, bold: bool = False, dim: bool = False):
+        text = text[:box_w]
+        col = box_left + max(0, (box_w - len(text)) // 2)
+        prefix = _ESC_BOLD if bold else (_ESC_DIM if dim else "")
+        suffix = _ESC_RESET if (bold or dim) else ""
+        put(row, col, f"{prefix}{text}{suffix}")
+
+    def put_box_left(row: int, text: str, bold: bool = False, dim: bool = False):
+        text = text[:box_w]
+        prefix = _ESC_BOLD if bold else (_ESC_DIM if dim else "")
+        suffix = _ESC_RESET if (bold or dim) else ""
+        put(row, box_left, f"{prefix}{text}{suffix}")
+
+    def put_tilde(row: int):
+        put(row, 1, f"{_ESC_DIM}~{_ESC_RESET}")
+
+    if cols < 40 or rows < 10:
+        put(1, 1, f"{_ESC_BOLD}Web Content Parser{_ESC_RESET}")
+        put(2, 1, "[1] Normal  [2] Recursive  Type 'exit' to quit")
+        input_row = 3
+        put(input_row, 1, "> ")
+        return "".join(buf), input_row, 3
+
+    # All content lines — find the widest to center the block
+    lines = [
+        ("Web Content Parser", True, False),
+        ('Type "exit" to quit.', False, True),
+        ("", False, False),
+        ("Select mode:", False, False),
+        ("[1] Normal    - process URLs individually", False, False),
+        ("[2] Recursive - crawl & combine into one doc", False, False),
+        ("", False, False),
+        ("> ", False, False),
+    ]
+    if error_msg:
+        lines.append((error_msg, False, False))
+
+    max_line_len = max(len(text) for text, _, _ in lines)
+    block_left = max(1, (cols - max_line_len) // 2 + 1)
+
+    content_h = len(lines)
+    top = max(1, (rows - content_h) // 2)
+    content_rows: set[int] = set()
+    r = top
+
+    input_row = 0
+    input_col = 0
+
+    for text, bold, dim in lines:
+        content_rows.add(r)
+        if text == "> ":
+            input_row = r
+            put(r, block_left, "> ")
+            input_col = block_left + 2
+        elif text == "":
+            pass  # blank gap line
+        else:
+            prefix = _ESC_BOLD if bold else (_ESC_DIM if dim else "")
+            suffix = _ESC_RESET if (bold or dim) else ""
+            put(r, block_left, f"{prefix}{text}{suffix}")
+        r += 1
+
+    if error_msg:
+        pass  # already rendered in the loop
+    else:
+        put(r, 1, "")
+    content_rows.add(r)
+
+    for row in range(1, rows + 1):
+        if row not in content_rows:
+            put_tilde(row)
+
+    return "".join(buf), input_row, input_col
+
+
+def interactive_prompt() -> tuple[list[str], str]:
+    """Interactive URL entry mode with centered Neovim-style UI.
+
+    Returns:
+        (urls, mode) where mode is "normal" or "recursive".
+    """
     import shutil
     import signal
 
@@ -811,6 +1188,7 @@ def interactive_prompt() -> list[str]:
     urls: list[str] = []
     error_msg = ""
     status_msg = ""
+    mode = "normal"
 
     def get_size() -> tuple[int, int]:
         s = shutil.get_terminal_size((80, 24))
@@ -820,7 +1198,20 @@ def interactive_prompt() -> list[str]:
         if not is_tty:
             return
         cols, rows = get_size()
-        screen, input_row, input_col = _render_screen(cols, rows, urls, error_msg, status_msg)
+        screen, input_row, input_col = _render_screen(
+            cols, rows, urls, error_msg, status_msg, mode=mode
+        )
+        stderr.write(_ESC_HIDE_CURSOR)
+        stderr.write(_ESC_CLEAR_SCREEN + _ESC_CURSOR_HOME + screen)
+        stderr.write(f"\033[{input_row};{input_col}H")
+        stderr.write(_ESC_SHOW_CURSOR)
+        stderr.flush()
+
+    def draw_mode_screen():
+        if not is_tty:
+            return
+        cols, rows = get_size()
+        screen, input_row, input_col = _render_mode_screen(cols, rows, error_msg)
         stderr.write(_ESC_HIDE_CURSOR)
         stderr.write(_ESC_CLEAR_SCREEN + _ESC_CURSOR_HOME + screen)
         stderr.write(f"\033[{input_row};{input_col}H")
@@ -830,12 +1221,10 @@ def interactive_prompt() -> list[str]:
     def enter_ui():
         if not is_tty:
             stderr.write("Web Content Parser - Interactive Mode\n")
-            stderr.write('Enter URLs one at a time. Type "ready" to start, "exit" to quit.\n\n')
+            stderr.write('[1] Normal  [2] Recursive  Type "exit" to quit.\n\n')
             return
         stderr.write(_ESC_ALT_SCREEN_ON)
         stderr.flush()
-        if hasattr(signal, 'SIGWINCH'):
-            signal.signal(signal.SIGWINCH, lambda *_: draw())
 
     def leave_ui():
         if not is_tty:
@@ -846,23 +1235,72 @@ def interactive_prompt() -> list[str]:
         stderr.write(_ESC_ALT_SCREEN_OFF)
         stderr.flush()
 
-    def read_line() -> str:
+    def read_line_for_screen(render_fn) -> str:
         """Read input constrained to the box, or fall back to input()."""
         if not is_tty:
             return input("")
         cols, _ = get_size()
         box_w = min(60, cols - 4)
-        box_left = max(1, (cols - box_w) // 2 + 1)
-        _, input_row, input_col = _render_screen(cols, get_size()[1], urls, error_msg, status_msg)
-        max_display = box_w - 2  # width after "> "
+        _, input_row, input_col = render_fn()
+        max_display = box_w - 2
         return _read_input(input_row, input_col, max_display)
 
     enter_ui()
     try:
-        draw()
+        # --- Mode selection phase ---
+        if hasattr(signal, 'SIGWINCH'):
+            signal.signal(signal.SIGWINCH, lambda *_: draw_mode_screen())
+
+        error_msg = ""
+        draw_mode_screen()
+
         while True:
             try:
-                raw = read_line()
+                def mode_render():
+                    cols, rows = get_size()
+                    return _render_mode_screen(cols, rows, error_msg)
+
+                raw = read_line_for_screen(mode_render)
+                raw = raw.strip().lower()
+                error_msg = ""
+
+                if not raw:
+                    draw_mode_screen()
+                    continue
+
+                if raw == "exit":
+                    leave_ui()
+                    sys.exit(0)
+
+                if raw in ("1", "normal"):
+                    mode = "normal"
+                    break
+                elif raw in ("2", "recursive"):
+                    mode = "recursive"
+                    break
+                else:
+                    error_msg = 'Type 1, 2, or "exit"'
+                    draw_mode_screen()
+                    continue
+
+            except (KeyboardInterrupt, EOFError):
+                continue
+
+        # --- URL entry phase ---
+        if hasattr(signal, 'SIGWINCH'):
+            signal.signal(signal.SIGWINCH, lambda *_: draw())
+
+        error_msg = ""
+        status_msg = ""
+        draw()
+
+        while True:
+            try:
+                def url_render():
+                    cols, rows = get_size()
+                    return _render_screen(cols, rows, urls, error_msg, status_msg, mode=mode)
+
+                raw = read_line_for_screen(url_render)
                 raw = raw.strip()
                 error_msg = ""
                 status_msg = ""
@@ -885,6 +1323,11 @@ def interactive_prompt() -> list[str]:
                     continue
 
                 urls.append(normalized)
+
+                # In recursive mode, start immediately after one URL
+                if mode == "recursive":
+                    break
+
                 draw()
 
             except (KeyboardInterrupt, EOFError):
@@ -899,12 +1342,13 @@ def interactive_prompt() -> list[str]:
         print("No URLs entered. Exiting.", file=sys.stderr)
         sys.exit(0)
 
-    print(f"\nURLs to process ({len(urls)}):", file=sys.stderr)
+    mode_label = "Recursive" if mode == "recursive" else "Normal"
+    print(f"\n[{mode_label} Mode] URLs to process ({len(urls)}):", file=sys.stderr)
     for i, url in enumerate(urls, 1):
         print(f"  {i}. {url}", file=sys.stderr)
     print(file=sys.stderr)
 
-    return urls
+    return urls, mode
 
 
 if __name__ == "__main__":
@@ -920,9 +1364,7 @@ if __name__ == "__main__":
         dynamic_threshold=not args.no_dynamic_threshold,
     )
 
-    if args.urls:
-        # CLI args mode: run once and exit
-        urls = args.urls
+    def _print_extraction_config():
         print("Extraction config:", file=sys.stderr)
         print(f"  Cleaning: {'enabled' if extraction_config.enable_cleaning else 'disabled'}", file=sys.stderr)
         print(f"  Pruning: {'enabled' if extraction_config.enable_pruning else 'disabled'}", file=sys.stderr)
@@ -930,19 +1372,40 @@ if __name__ == "__main__":
             print(f"  Pruning threshold: {extraction_config.pruning_threshold}", file=sys.stderr)
         print(f"  Min words per block: {extraction_config.min_words}", file=sys.stderr)
         print(file=sys.stderr)
-        asyncio.run(main(urls, extraction_config))
+
+    if args.urls:
+        # CLI args mode: run once and exit
+        urls = args.urls
+        _print_extraction_config()
+
+        if args.recursive:
+            # Recursive mode via CLI
+            if len(urls) != 1:
+                print("Error: Recursive mode requires exactly one URL.", file=sys.stderr)
+                sys.exit(1)
+            crawl_config = CrawlConfig(
+                rate_limit=args.crawl_delay,
+                request_timeout=TIMEOUT_SECS,
+            )
+            asyncio.run(main_recursive(
+                urls[0], extraction_config, crawl_config, max_pages=args.max_pages
+            ))
+        else:
+            asyncio.run(main(urls, extraction_config))
     elif sys.stdin.isatty():
         # Interactive mode: loop until user types "exit"
         while True:
-            urls = interactive_prompt()
-            print("Extraction config:", file=sys.stderr)
-            print(f"  Cleaning: {'enabled' if extraction_config.enable_cleaning else 'disabled'}", file=sys.stderr)
-            print(f"  Pruning: {'enabled' if extraction_config.enable_pruning else 'disabled'}", file=sys.stderr)
-            if extraction_config.enable_pruning:
-                print(f"  Pruning threshold: {extraction_config.pruning_threshold}", file=sys.stderr)
-            print(f"  Min words per block: {extraction_config.min_words}", file=sys.stderr)
-            print(file=sys.stderr)
-            asyncio.run(main(urls, extraction_config))
+            urls, mode = interactive_prompt()
+            _print_extraction_config()
+
+            if mode == "recursive":
+                crawl_config = CrawlConfig(
+                    rate_limit=args.crawl_delay,
+                    request_timeout=TIMEOUT_SECS,
+                )
+                asyncio.run(main_recursive(urls[0], extraction_config, crawl_config))
+            else:
+                asyncio.run(main(urls, extraction_config))
             _wait_for_q()
     else:
         print("Error: No URLs provided. In non-interactive mode, pass URLs as arguments.", file=sys.stderr)
