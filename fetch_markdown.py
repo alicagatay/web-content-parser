@@ -20,6 +20,7 @@ from html_cleaner import filter_short_blocks
 from auth import get_docs_service, get_drive_service, find_folder_id
 from google_drive import (
     sanitize_doc_title,
+    _collect_subtree_folder_ids_sync,
     _build_doc_title_cache_sync,
     create_google_doc,
     find_standalone_docs_for_urls_sync,
@@ -375,22 +376,26 @@ async def main(urls: list[str], config: ExtractionConfig) -> None:
     urls_to_process = list(urls)
     retry_round = 0
 
-    # Build a doc title cache once per run to avoid repeated recursive searches
+    # Walk the Resources subtree once; both duplicate checks below reuse it.
     try:
+        folder_ids = await asyncio.to_thread(
+            _collect_subtree_folder_ids_sync, drive_service, folder_id
+        )
         doc_cache = await asyncio.to_thread(
-            _build_doc_title_cache_sync, drive_service, folder_id
+            _build_doc_title_cache_sync, drive_service, folder_ids
         )
         cache_lock = asyncio.Lock()
         print(f"✓ Cached {len(doc_cache)} existing docs from Drive", file=sys.stderr)
     except Exception as e:
         print(f"Warning: Failed to build doc cache, falling back to recursive lookups: {e}", file=sys.stderr)
+        folder_ids = []
         doc_cache = None
         cache_lock = None
 
     # Cross-mode dedup: skip URLs already covered by a recursive (tabbed) doc
     try:
         tabbed_docs = await asyncio.to_thread(
-            find_all_tabbed_base_urls_sync, drive_service, folder_id
+            find_all_tabbed_base_urls_sync, drive_service, folder_ids
         )
         if tabbed_docs:
             tabbed_base_urls = [base_url for _, base_url in tabbed_docs]
@@ -549,6 +554,27 @@ async def main_recursive(
         print(f"\n❌ Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Walk the Resources subtree once; reused by the check below and Phase 4b.
+    folder_ids: list[str] = []
+    try:
+        folder_ids = await asyncio.to_thread(
+            _collect_subtree_folder_ids_sync, drive_service, folder_id
+        )
+        # Skip if a tabbed doc already covers this base URL (avoid duplicate crawls)
+        tabbed_docs = await asyncio.to_thread(
+            find_all_tabbed_base_urls_sync, drive_service, folder_ids
+        )
+        norm_base = normalize_url(base_url)
+        for doc_id, existing_base in tabbed_docs:
+            if is_within_prefix(norm_base, existing_base):
+                existing_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+                print(f"\n↺ A tabbed doc already covers {base_url}:", file=sys.stderr)
+                print(f"  {existing_url}", file=sys.stderr)
+                print("Nothing to do.", file=sys.stderr)
+                return
+    except Exception as e:
+        print(f"Warning: Tabbed-doc dedup check failed: {e}", file=sys.stderr)
+
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECS)
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -684,7 +710,7 @@ async def main_recursive(
         try:
             processed_urls = [url for url, _, _ in pages]
             standalone_matches = await asyncio.to_thread(
-                find_standalone_docs_for_urls_sync, drive_service, folder_id, processed_urls
+                find_standalone_docs_for_urls_sync, drive_service, folder_ids, processed_urls
             )
             if standalone_matches:
                 for doc_id, doc_name, source in standalone_matches:

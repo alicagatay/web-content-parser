@@ -101,46 +101,104 @@ def _find_existing_doc_id_recursive_sync(
     return None
 
 
-def _build_doc_title_cache_sync(
+def _collect_subtree_folder_ids_sync(
     drive_service,
     root_folder_id: str
-) -> dict[str, tuple[str, bool]]:
+) -> list[str]:
     """
-    Synchronous helper: Build a cache of document titles to IDs by
-    listing all docs in the root folder (single query, no recursion).
+    Synchronous helper: Return the root folder ID plus every nested
+    subfolder ID beneath it (BFS over the folder tree).
+
+    Used so duplicate-detection queries can cover the entire Resources
+    subtree, not just the top-level folder.
 
     Args:
         drive_service: Authenticated Google Drive service
-        root_folder_id: ID of the root folder to search in
+        root_folder_id: ID of the folder whose subtree to enumerate
+
+    Returns:
+        list[str]: [root_folder_id, ...all descendant folder IDs]
+    """
+    folder_query_template = (
+        "'{folder_id}' in parents and "
+        "mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+
+    all_ids: list[str] = []
+    queue = deque([root_folder_id])
+    visited = set()
+
+    while queue:
+        folder_id = queue.popleft()
+        if folder_id in visited:
+            continue
+        visited.add(folder_id)
+        all_ids.append(folder_id)
+
+        page_token = None
+        while True:
+            folder_results = drive_service.files().list(
+                q=folder_query_template.format(folder_id=folder_id),
+                spaces='drive',
+                fields='nextPageToken, files(id)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+
+            for folder in folder_results.get('files', []):
+                child_id = folder.get('id')
+                if child_id and child_id not in visited:
+                    queue.append(child_id)
+
+            page_token = folder_results.get('nextPageToken')
+            if not page_token:
+                break
+
+    return all_ids
+
+
+def _build_doc_title_cache_sync(
+    drive_service,
+    folder_ids: list[str],
+) -> dict[str, tuple[str, bool]]:
+    """
+    Synchronous helper: Build a cache of document titles to IDs by listing
+    all docs across the given folders (the Resources subtree).
+
+    Args:
+        drive_service: Authenticated Google Drive service
+        folder_ids: Folder IDs to scan, from _collect_subtree_folder_ids_sync
+            (the Resources root + all nested subfolders).
 
     Returns:
         dict[str, tuple[str, bool]]: Mapping of document title -> (document ID, created_this_run)
     """
     doc_cache: dict[str, tuple[str, bool]] = {}
-    query = (
-        f"'{root_folder_id}' in parents and "
-        f"mimeType='application/vnd.google-apps.document' and trashed=false"
-    )
+    for folder_id in folder_ids:
+        query = (
+            f"'{folder_id}' in parents and "
+            f"mimeType='application/vnd.google-apps.document' and trashed=false"
+        )
 
-    page_token = None
-    while True:
-        results = drive_service.files().list(
-            q=query,
-            spaces='drive',
-            fields='nextPageToken, files(id, name)',
-            pageSize=1000,
-            pageToken=page_token
-        ).execute()
+        page_token = None
+        while True:
+            results = drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
 
-        for doc in results.get('files', []):
-            doc_id = doc.get('id')
-            doc_name = doc.get('name')
-            if doc_id and doc_name and doc_name not in doc_cache:
-                doc_cache[doc_name] = (doc_id, False)
+            for doc in results.get('files', []):
+                doc_id = doc.get('id')
+                doc_name = doc.get('name')
+                if doc_id and doc_name and doc_name not in doc_cache:
+                    doc_cache[doc_name] = (doc_id, False)
 
-        page_token = results.get('nextPageToken')
-        if not page_token:
-            break
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
 
     return doc_cache
 
@@ -263,80 +321,90 @@ async def create_google_doc(
 
 def find_standalone_docs_for_urls_sync(
     drive_service,
-    folder_id: str,
+    folder_ids: list[str],
     urls: list[str],
 ) -> list[tuple[str, str, str]]:
     """Find standalone docs whose source_url matches any of the given URLs.
+
+    Scans the given folders (the Resources root + all nested subfolders).
 
     Returns list of (doc_id, doc_name, source_url) tuples.
     """
     normalized_set = {normalize_url(u) for u in urls}
 
-    query = (
-        f"'{folder_id}' in parents and "
-        f"mimeType='application/vnd.google-apps.document' and "
-        f"trashed=false and "
-        f"appProperties has {{ key='doc_mode' and value='standalone' }}"
-    )
-
     matches = []
-    page_token = None
-    while True:
-        results = drive_service.files().list(
-            q=query,
-            spaces='drive',
-            fields='nextPageToken, files(id, name, appProperties)',
-            pageSize=1000,
-            pageToken=page_token,
-        ).execute()
+    for fid in folder_ids:
+        query = (
+            f"'{fid}' in parents and "
+            f"mimeType='application/vnd.google-apps.document' and "
+            f"trashed=false and "
+            f"appProperties has {{ key='doc_mode' and value='standalone' }}"
+        )
 
-        for doc in results.get('files', []):
-            props = doc.get('appProperties', {})
-            source = props.get('source_url', '')
-            if source in normalized_set:
-                matches.append((doc['id'], doc['name'], source))
+        page_token = None
+        while True:
+            results = drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name, appProperties)',
+                pageSize=1000,
+                pageToken=page_token,
+            ).execute()
 
-        page_token = results.get('nextPageToken')
-        if not page_token:
-            break
+            for doc in results.get('files', []):
+                props = doc.get('appProperties', {})
+                source = props.get('source_url', '')
+                if source in normalized_set:
+                    matches.append((doc['id'], doc['name'], source))
+
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
 
     return matches
 
 
 def find_all_tabbed_base_urls_sync(
     drive_service,
-    folder_id: str,
+    folder_ids: list[str],
 ) -> list[tuple[str, str]]:
     """Find all tabbed (recursive mode) docs and return their base URLs.
 
+    Scans the given folders (the Resources root + all nested subfolders).
+
+    Args:
+        drive_service: Authenticated Google Drive service
+        folder_ids: Folder IDs to scan, from _collect_subtree_folder_ids_sync.
+
     Returns list of (doc_id, base_url) tuples.
     """
-    query = (
-        f"'{folder_id}' in parents and "
-        f"mimeType='application/vnd.google-apps.document' and "
-        f"trashed=false and "
-        f"appProperties has {{ key='doc_mode' and value='tabbed' }}"
-    )
-
     results_list = []
-    page_token = None
-    while True:
-        results = drive_service.files().list(
-            q=query,
-            spaces='drive',
-            fields='nextPageToken, files(id, appProperties)',
-            pageSize=1000,
-            pageToken=page_token,
-        ).execute()
+    for fid in folder_ids:
+        query = (
+            f"'{fid}' in parents and "
+            f"mimeType='application/vnd.google-apps.document' and "
+            f"trashed=false and "
+            f"appProperties has {{ key='doc_mode' and value='tabbed' }}"
+        )
 
-        for doc in results.get('files', []):
-            props = doc.get('appProperties', {})
-            base_url = props.get('base_url', '')
-            if base_url:
-                results_list.append((doc['id'], base_url))
+        page_token = None
+        while True:
+            results = drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='nextPageToken, files(id, appProperties)',
+                pageSize=1000,
+                pageToken=page_token,
+            ).execute()
 
-        page_token = results.get('nextPageToken')
-        if not page_token:
-            break
+            for doc in results.get('files', []):
+                props = doc.get('appProperties', {})
+                base_url = props.get('base_url', '')
+                if base_url:
+                    results_list.append((doc['id'], base_url))
+
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
 
     return results_list
